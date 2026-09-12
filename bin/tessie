@@ -1,0 +1,223 @@
+#!/bin/bash
+# Backend for the Tessie bar widget. The widget never talks to the API
+# itself: it runs `tessie state` on a timer and `tessie command <name>` for its
+# buttons, so everything that touches the token lives in this one file and
+# can be tried from a terminal.
+#
+#   tessie login             store a Tessie API token (keyring, else a 0600 file)
+#   tessie logout            forget the stored token and the cached VIN
+#   tessie vin               print the VIN in use
+#   tessie state             print one JSON snapshot of the car (never wakes it)
+#   tessie command <name>    send a command: lock, unlock, start_climate,
+#                            stop_climate, flash, honk, enable_sentry,
+#                            disable_sentry, open_charge_port, close_charge_port
+#
+# state and command always print a single JSON object, {"ok": false, ...} on
+# failure, so the widget has exactly one thing to parse.
+#
+# Environment: TESSIE_TOKEN and TESSIE_VIN override the stored values,
+# TESSIE_API points at another server and TESSIE_NO_KEYRING=1 skips the
+# keyring (the tests use both).
+
+set -uo pipefail
+
+API=${TESSIE_API:-https://api.tessie.com}
+CONFIG_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-tessie
+CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-tessie
+TOKEN_FILE=$CONFIG_DIR/token
+VIN_FILE=$CACHE_DIR/vin
+
+COMMANDS=(lock unlock start_climate stop_climate flash honk enable_sentry disable_sentry open_charge_port close_charge_port)
+
+WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+TOKEN=""
+VIN=""
+
+fail() {
+  jq -cn --arg error "$1" --arg code "${2:-error}" '{ok: false, code: $code, error: $error}'
+  exit 1
+}
+
+keyring() { [[ -z ${TESSIE_NO_KEYRING:-} ]] && command -v secret-tool >/dev/null; }
+
+load_token() {
+  if [[ -n ${TESSIE_TOKEN:-} ]]; then TOKEN=$TESSIE_TOKEN; return; fi
+  if keyring; then TOKEN=$(secret-tool lookup service tessie 2>/dev/null); fi
+  if [[ -z $TOKEN && -r $TOKEN_FILE ]]; then TOKEN=$(tr -d '[:space:]' <"$TOKEN_FILE"); fi
+  [[ -n $TOKEN ]] || fail "No Tessie token yet. Run: $0 login" notoken
+}
+
+# api METHOD PATH OUTFILE prints the HTTP status, 000 when unreachable. The
+# header goes through a process substitution so the token never shows up in
+# curl's argv (and so in ps).
+api() {
+  curl -sS --max-time "${TESSIE_TIMEOUT:-20}" -X "$1" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$TOKEN") \
+    -H 'Accept: application/json' \
+    -o "$3" -w '%{http_code}' "$API$2" 2>/dev/null
+  return 0
+}
+
+# The message Tessie put in an error body, if it sent one.
+reason() { jq -r '(.error // .reason // .message // empty) | tostring' "$1" 2>/dev/null; }
+
+check_status() {
+  local status=$1 body=$2 what=$3
+  case $status in
+    2*) return 0 ;;
+    401|403) fail "Tessie rejected the token" auth ;;
+    000) fail "Tessie is unreachable" network ;;
+  esac
+  local why; why=$(reason "$body")
+  fail "$what failed (HTTP $status)${why:+: $why}" http
+}
+
+resolve_vin() {
+  if [[ -n ${TESSIE_VIN:-} ]]; then VIN=$TESSIE_VIN; return; fi
+  if [[ -s $VIN_FILE ]]; then VIN=$(tr -d '[:space:]' <"$VIN_FILE"); return; fi
+  local status; status=$(api GET "/vehicles?only_active=true" "$WORK/vehicles")
+  check_status "$status" "$WORK/vehicles" "Listing vehicles"
+  VIN=$(jq -r '.results[0].vin // empty' "$WORK/vehicles" 2>/dev/null)
+  [[ -n $VIN ]] || fail "No vehicles on this Tessie account" novehicle
+  mkdir -p "$CACHE_DIR"
+  printf '%s\n' "$VIN" >"$VIN_FILE"
+}
+
+# The body of an optional request, or null when it failed. Only /state is
+# required; a car without TPMS or charge history still gets a snapshot.
+part() {
+  if [[ $(<"$WORK/$1.code") == 2* ]] && jq -e 'type == "object"' "$WORK/$1" >/dev/null 2>&1; then
+    jq -c . "$WORK/$1"
+  else
+    echo null
+  fi
+}
+
+# TESSIE_DEMO=1 answers with a made-up car and never calls Tessie: for
+# screenshots, and for trying the widget without a Tesla.
+demo_state() {
+  jq -cn --argjson now "$(date +%s)" '{
+    ok: true, vin: "DEMO", fetchedAt: $now, status: "awake",
+    state: {
+      display_name: "Sparky", state: "online",
+      drive_state: {latitude: 55.3368, longitude: 10.9950, speed: 68.4, shift_state: "D",
+                    heading: 78, gps_as_of: $now, timestamp: ($now * 1000)},
+      charge_state: {battery_level: 68, battery_range: 198.4, charge_limit_soc: 90,
+                     charging_state: "Disconnected", charge_port_door_open: false, timestamp: ($now * 1000)},
+      climate_state: {inside_temp: 21, outside_temp: 14, is_climate_on: true, timestamp: ($now * 1000)},
+      vehicle_state: {locked: true, sentry_mode: false, odometer: 42318.6,
+                      car_version: "2025.44.2 demo", timestamp: ($now * 1000)},
+      vehicle_config: {car_type: "model3"},
+      gui_settings: {gui_distance_units: "km/hr"}
+    },
+    location: {latitude: 55.3368, longitude: 10.9950,
+               address: "E20, Storebæltsbroen, 4220 Korsør, Denmark", saved_location: null},
+    tires: {front_left: 3.0, front_right: 3.0, rear_left: 2.9, rear_right: 2.9},
+    lastCharge: {energy_added: 14.2, location: "Home"}
+  }'
+}
+
+cmd_state() {
+  if [[ -n ${TESSIE_DEMO:-} ]]; then demo_state; return; fi
+  load_token
+  resolve_vin
+  # use_cache=true is Tessie's default and never wakes the car.
+  api GET "/$VIN/state?use_cache=true" "$WORK/state" >"$WORK/state.code" &
+  api GET "/$VIN/location" "$WORK/location" >"$WORK/location.code" &
+  api GET "/$VIN/tire_pressure?pressure_format=bar" "$WORK/tires" >"$WORK/tires.code" &
+  api GET "/$VIN/charges?limit=1&distance_format=km" "$WORK/charges" >"$WORK/charges.code" &
+  api GET "/$VIN/status" "$WORK/status" >"$WORK/status.code" &
+  wait
+
+  local status; status=$(<"$WORK/state.code")
+  if [[ $status == 404 && -z ${TESSIE_VIN:-} ]]; then
+    rm -f "$VIN_FILE"
+    fail "Vehicle $VIN is not on this Tessie account" novehicle
+  fi
+  check_status "$status" "$WORK/state" "Reading the car"
+  jq -e 'type == "object"' "$WORK/state" >/dev/null 2>&1 || fail "Tessie sent an unreadable state" http
+
+  jq -cn \
+    --arg vin "$VIN" \
+    --argjson fetchedAt "$(date +%s)" \
+    --slurpfile state "$WORK/state" \
+    --argjson location "$(part location)" \
+    --argjson tires "$(part tires)" \
+    --argjson charges "$(part charges)" \
+    --argjson status "$(part status)" \
+    '{ok: true, vin: $vin, fetchedAt: $fetchedAt, state: $state[0],
+      location: $location, tires: $tires,
+      lastCharge: (($charges // {}) | .results // [] | .[0]) // null,
+      status: ($status // {}) | .status // null}'
+}
+
+cmd_command() {
+  local name=${1:-}
+  [[ " ${COMMANDS[*]} " == *" $name "* ]] || fail "Unknown command: ${name:-none}" usage
+  if [[ -n ${TESSIE_DEMO:-} ]]; then
+    sleep 0.4
+    jq -cn --arg command "$name" '{ok: true, command: $command}'
+    return
+  fi
+  load_token
+  resolve_vin
+  local status; status=$(api POST "/$VIN/command/$name?wait_for_completion=true" "$WORK/command")
+  check_status "$status" "$WORK/command" "${name//_/ }"
+  if jq -e '.result == true' "$WORK/command" >/dev/null 2>&1; then
+    jq -cn --arg command "$name" '{ok: true, command: $command}'
+  else
+    local why; why=$(reason "$WORK/command")
+    fail "The car did not ${name//_/ }${why:+: $why}" rejected
+  fi
+}
+
+cmd_vin() {
+  load_token
+  resolve_vin
+  printf '%s\n' "$VIN"
+}
+
+cmd_login() {
+  local token
+  if [[ -t 0 ]]; then
+    echo "Create a token at https://dash.tessie.com/settings/api"
+    read -rsp "Tessie API token: " token
+    echo
+  else
+    read -r token
+  fi
+  token=${token//[[:space:]]/}
+  [[ -n $token ]] || { echo "No token given." >&2; exit 1; }
+
+  # Try the token before storing it, so a typo fails here and not in the bar.
+  TOKEN=$token
+  local status; status=$(api GET "/vehicles?only_active=true" "$WORK/vehicles")
+  [[ $status == 2* ]] || { echo "Tessie rejected that token (HTTP $status)." >&2; exit 1; }
+
+  rm -f "$VIN_FILE"
+  if keyring && printf '%s' "$token" | secret-tool store --label="Tessie API token" service tessie 2>/dev/null; then
+    rm -f "$TOKEN_FILE"
+    echo "Token saved to your keyring."
+  else
+    mkdir -p "$CONFIG_DIR"
+    (umask 077; printf '%s\n' "$token" >"$TOKEN_FILE")
+    echo "Token saved to $TOKEN_FILE."
+  fi
+  jq -r '.results | map(.vin) | if length == 0 then "No vehicles on this account yet."
+    else "Vehicles: " + join(", ") end' "$WORK/vehicles"
+}
+
+cmd_logout() {
+  if keyring; then secret-tool clear service tessie 2>/dev/null; fi
+  rm -f "$TOKEN_FILE" "$VIN_FILE"
+  echo "Forgot the Tessie token."
+}
+
+case ${1:-} in
+  state) cmd_state ;;
+  command) shift; cmd_command "$@" ;;
+  vin) cmd_vin ;;
+  login) cmd_login ;;
+  logout) cmd_logout ;;
+  *) sed -n '2,/^$/{s/^# \{0,1\}//;p}' "$0"; exit 2 ;;
+esac

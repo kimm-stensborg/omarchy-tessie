@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.kimm-stensborg.tessie",
+  "name": "Tessie",
+  "version": "0.2.0",
+  "author": "Kimm Stensborg",
+  "license": "MIT",
+  "description": "Locate and control your Tesla from the bar, through Tessie",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Tessie",
+    "description": "Map, battery and vitals of your Tesla, with lock, climate, sentry, charge port, flash and honk",
+    "category": "Info",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshMinutes": 5,
+      "mapZoom": 16
+    },
+    "schema": [
+      { "key": "name", "type": "string", "label": "Car name (empty uses the name set in the car, else the model)" },
+      { "key": "vin", "type": "string", "label": "VIN (empty uses the first car on the account)" },
+      { "key": "units", "type": "string", "label": "Units: metric, imperial, or empty to follow the car" },
+      { "key": "refreshMinutes", "type": "integer", "label": "Refresh interval while closed (minutes)", "min": 1, "max": 60, "step": 1, "defaultValue": 5 },
+      { "key": "mapZoom", "type": "integer", "label": "Map zoom (up to 16, or 19 with a CARTO key)", "min": 3, "max": 19, "step": 1, "defaultValue": 16 },
+      { "key": "cartoKey", "type": "string", "label": "CARTO basemaps key (free at carto.com/basemaps/apikey)" },
+      { "key": "mapsUrl", "type": "string", "label": "Maps link, with {lat} and {lon}" }
+    ]
+  }
+}
