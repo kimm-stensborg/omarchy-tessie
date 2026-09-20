@@ -223,48 +223,124 @@ function tessieStatus(raw) {
 
 // The panel's toggles and one-shot buttons, derived from the current state.
 // Toggles render selected while on; `confirm` asks for a second click.
-function controls(state) {
+// Unlocking asks twice unless the "Ask before unlocking" setting is off.
+//
+// Every one of these is an option on the settings page, and only the six in
+// CONTROL_DEFAULTS are shown until you say otherwise — the grid is three to a
+// row, and all of them at once is four rows of buttons under the vitals.
+function controls(state, confirmUnlock) {
+  var ask = confirmUnlock !== false
   var s = state || {}
   var vs = s.vehicle_state || {}
   var cs = s.climate_state || {}
   var ch = s.charge_state || {}
+  var charging = ch.charging_state === "Charging"
+  var windowsOpen = ["fd_window", "fp_window", "rd_window", "rp_window"].some(function(k) {
+    return (number(vs[k]) || 0) > 0
+  })
+  var defrosting = (number(cs.defrost_mode) || 0) > 0
   return [
-    { id: "lock", icon: vs.locked === false ? "" : "",
+    { id: "lock", icon: vs.locked === false ? "\uf09c" : "\uf023",
       label: vs.locked === false ? "Unlocked" : "Locked",
       command: vs.locked === true ? "unlock" : "lock",
-      active: vs.locked === true, confirm: vs.locked === true },
-    { id: "climate", icon: "", label: "Climate",
+      active: vs.locked === true, confirm: ask && vs.locked === true },
+    { id: "climate", icon: "\uf2dc", label: "Climate",
       command: cs.is_climate_on ? "stop_climate" : "start_climate",
       active: cs.is_climate_on === true, confirm: false },
-    { id: "sentry", icon: "", label: "Sentry",
+    { id: "sentry", icon: "\uf06e", label: "Sentry",
       command: vs.sentry_mode ? "disable_sentry" : "enable_sentry",
       active: vs.sentry_mode === true, confirm: false },
-    { id: "port", icon: "", label: "Port",
+    { id: "port", icon: "\uf1e6", label: "Port",
       command: ch.charge_port_door_open ? "close_charge_port" : "open_charge_port",
       active: ch.charge_port_door_open === true, confirm: false },
-    { id: "flash", icon: "", label: "Flash", command: "flash", active: false, confirm: false },
-    { id: "honk", icon: "", label: "Honk", command: "honk", active: false, confirm: false }
+    { id: "flash", icon: "\uf0eb", label: "Flash", command: "flash", active: false, confirm: false },
+    { id: "honk", icon: "\uf0a1", label: "Honk", command: "honk", active: false, confirm: false },
+    // Stopping a charge is the one of these you might not mean, so it asks.
+    { id: "charge", icon: "\uf0e7", label: charging ? "Charging" : "Charge",
+      command: charging ? "stop_charging" : "start_charging",
+      active: charging, confirm: charging },
+    { id: "frunk", icon: "\uf1b9", label: "Frunk",
+      command: "activate_front_trunk",
+      active: (number(vs.ft) || 0) > 0, confirm: false },
+    { id: "trunk", icon: "\uf187", label: "Trunk",
+      command: "activate_rear_trunk",
+      active: (number(vs.rt) || 0) > 0, confirm: false },
+    { id: "windows", icon: "\uf2d0", label: windowsOpen ? "Close up" : "Vent",
+      command: windowsOpen ? "close_windows" : "vent_windows",
+      active: windowsOpen, confirm: false },
+    { id: "defrost", icon: "\uf185", label: "Defrost",
+      command: defrosting ? "stop_max_defrost" : "start_max_defrost",
+      active: defrosting, confirm: false },
+    // Reading never wakes the car, so this is the only way to ask it to come
+    // up without giving it something else to do.
+    { id: "wake", icon: "\uf011", label: "Wake", command: "wake", active: false, confirm: false }
   ]
+}
+
+// The vitals grid: one row per fact, each with the id the "Vitals" setting
+// names it by. Lives here rather than in the panel so the ids and the values
+// cannot drift apart.
+function stats(snapshot, imperial) {
+  var s = snapshot && snapshot.state
+  if (!s) return []
+  var vs = s.vehicle_state || {}
+  var cs = s.climate_state || {}
+  var ch = s.charge_state || {}
+  var pressures = tyres(snapshot.tires, vs, imperial)
+  var last = snapshot.lastCharge
+  return [
+    { id: "locked", label: "locked", value: yesNo(vs.locked) },
+    { id: "sentry", label: "sentry", value: onOff(vs.sentry_mode) },
+    { id: "odometer", label: "odometer", value: formatDistance(vs.odometer, imperial) },
+    { id: "tyres", label: "tyres", value: pressures.text, warn: pressures.low },
+    { id: "inside", label: "inside", value: formatTemp(cs.inside_temp, imperial) },
+    { id: "outside", label: "outside", value: formatTemp(cs.outside_temp, imperial) },
+    { id: "chargeLimit", label: "charge limit", value: formatPercent(ch.charge_limit_soc) },
+    { id: "lastCharge", label: "last charge", value: last ? formatEnergy(last.energy_added) : "\u2014" },
+    { id: "climate", label: "climate", value: onOff(cs.is_climate_on) },
+    { id: "software", label: "software", value: vs.car_version ? String(vs.car_version).split(" ")[0] : "\u2014" }
+  ]
+}
+
+// What rides next to the T in the bar, for the "Next to the T" setting.
+function barLabel(snapshot, imperial, mode) {
+  var ch = snapshot && snapshot.state && snapshot.state.charge_state
+    ? snapshot.state.charge_state : null
+  if (!ch) return ""
+  if (mode === "battery") return number(ch.battery_level) === null ? "" : formatPercent(ch.battery_level)
+  if (mode === "range") return number(ch.battery_range) === null ? "" : formatDistance(ch.battery_range, imperial)
+  return ""
 }
 
 // The state a command should leave behind, so a button flips the moment the
 // car accepts it instead of waiting for Tessie's cache to catch up. Returns a
 // copy; commands with no lasting state (flash, honk) change nothing.
+var WINDOWS = ["fd_window", "fp_window", "rd_window", "rp_window"]
+
 var COMMAND_EFFECTS = {
-  lock: ["vehicle_state", "locked", true],
-  unlock: ["vehicle_state", "locked", false],
-  start_climate: ["climate_state", "is_climate_on", true],
-  stop_climate: ["climate_state", "is_climate_on", false],
-  enable_sentry: ["vehicle_state", "sentry_mode", true],
-  disable_sentry: ["vehicle_state", "sentry_mode", false],
-  open_charge_port: ["charge_state", "charge_port_door_open", true],
-  close_charge_port: ["charge_state", "charge_port_door_open", false]
+  lock: [["vehicle_state", "locked", true]],
+  unlock: [["vehicle_state", "locked", false]],
+  start_climate: [["climate_state", "is_climate_on", true]],
+  stop_climate: [["climate_state", "is_climate_on", false]],
+  enable_sentry: [["vehicle_state", "sentry_mode", true]],
+  disable_sentry: [["vehicle_state", "sentry_mode", false]],
+  open_charge_port: [["charge_state", "charge_port_door_open", true]],
+  close_charge_port: [["charge_state", "charge_port_door_open", false]],
+  start_charging: [["charge_state", "charging_state", "Charging"]],
+  stop_charging: [["charge_state", "charging_state", "Stopped"]],
+  start_max_defrost: [["climate_state", "defrost_mode", 2]],
+  stop_max_defrost: [["climate_state", "defrost_mode", 0]],
+  vent_windows: WINDOWS.map(function(w) { return ["vehicle_state", w, 1] }),
+  close_windows: WINDOWS.map(function(w) { return ["vehicle_state", w, 0] })
+  // The trunks and wake leave nothing this panel can predict: whether a lid
+  // went up or down is the car's answer, which the follow-up refresh brings.
 }
 
 function afterCommand(state, command) {
   var next = JSON.parse(JSON.stringify(state || {}))
-  var effect = COMMAND_EFFECTS[command]
-  if (effect) {
+  var effects = COMMAND_EFFECTS[command] || []
+  for (var i = 0; i < effects.length; i++) {
+    var effect = effects[i]
     next[effect[0]] = next[effect[0]] || {}
     next[effect[0]][effect[1]] = effect[2]
   }
@@ -324,6 +400,279 @@ function mapsUrl(lat, lon, template) {
   return t.replace(/\{lat\}/g, String(lat)).replace(/\{lon\}/g, String(lon))
 }
 
+// ---------------------------------------------------------------- settings
+//
+// Everything the settings page shows, in the order it shows it. One list
+// drives the page, the defaults and the shell.json writes, so a new option is
+// a row here and nothing else. `fallback` is what the widget does when the
+// key is absent, and a value that equals it is never written out — an option
+// left alone stays out of shell.json, and a later default change reaches
+// anyone who never touched it.
+//
+// kinds: text, choice (one of `options`), number (clamped to min/max),
+// toggle (on/off), multi (any of `options`; unset means all of them).
+
+var CONTROL_OPTIONS = [
+  { value: "lock", label: "Lock" }, { value: "climate", label: "Climate" },
+  { value: "sentry", label: "Sentry" }, { value: "port", label: "Charge port" },
+  { value: "flash", label: "Flash" }, { value: "honk", label: "Honk" },
+  { value: "charge", label: "Charge" }, { value: "frunk", label: "Frunk" },
+  { value: "trunk", label: "Trunk" }, { value: "windows", label: "Windows" },
+  { value: "defrost", label: "Defrost" }, { value: "wake", label: "Wake" }
+]
+
+// The six the panel shows until you pick your own. All twelve would be four
+// rows of buttons, so the rest are there to swap in rather than to pile on.
+var CONTROL_DEFAULTS = ["lock", "climate", "sentry", "port", "flash", "honk"]
+
+var STAT_OPTIONS = [
+  { value: "locked", label: "Locked" }, { value: "sentry", label: "Sentry" },
+  { value: "odometer", label: "Odometer" }, { value: "tyres", label: "Tyres" },
+  { value: "inside", label: "Inside" }, { value: "outside", label: "Outside" },
+  { value: "chargeLimit", label: "Charge limit" }, { value: "lastCharge", label: "Last charge" },
+  { value: "climate", label: "Climate" }, { value: "software", label: "Software" }
+]
+
+var SETTINGS = [
+  { title: "Car", rows: [
+    { key: "name", kind: "text", label: "Name", fallback: "",
+      placeholder: "From the car", hint: "Empty uses the name set in the car, else its model" },
+    { key: "vin", kind: "text", label: "VIN", fallback: "",
+      placeholder: "First car on the account", hint: "Which car to show" },
+    { key: "units", kind: "choice", label: "Units", fallback: "",
+      options: [{ value: "", label: "Follow the car" }, { value: "metric", label: "Metric" },
+                { value: "imperial", label: "Imperial" }] }
+  ]},
+  { title: "In the bar", rows: [
+    { key: "barLabel", kind: "choice", label: "Next to the T", fallback: "none",
+      options: [{ value: "none", label: "Nothing" }, { value: "battery", label: "Battery" },
+                { value: "range", label: "Range" }] }
+  ]},
+  { title: "In the panel", rows: [
+    { key: "showMap", kind: "toggle", label: "Map", fallback: true },
+    { key: "mapZoom", kind: "number", label: "Map zoom", fallback: 16, min: 3, max: 19,
+      hint: "Past 16 needs a CARTO key" },
+    { key: "stats", kind: "multi", label: "Vitals",
+      fallback: STAT_OPTIONS.map(function(o) { return o.value }), options: STAT_OPTIONS },
+    { key: "controls", kind: "multi", label: "Controls",
+      hint: "Six fit under the vitals; the rest are there to swap in",
+      fallback: CONTROL_DEFAULTS, options: CONTROL_OPTIONS },
+    { key: "confirmUnlock", kind: "toggle", label: "Ask before unlocking", fallback: true },
+    { key: "showFooter", kind: "toggle", label: "Tessie status footer", fallback: true }
+  ]},
+  { title: "Data", rows: [
+    { key: "refreshMinutes", kind: "number", label: "Refresh while closed (minutes)",
+      fallback: 5, min: 1, max: 60 },
+    { key: "demo", kind: "toggle", label: "Demo car", fallback: false,
+      hint: "A made-up car; never calls Tessie" }
+  ]},
+  { title: "Map and links", rows: [
+    { key: "cartoKey", kind: "text", label: "CARTO key", fallback: "", secret: true,
+      placeholder: "Esri basemap", hint: "Free at carto.com/basemaps/apikey: sharper tiles, zoom to 19" },
+    { key: "mapsUrl", kind: "text", label: "Maps link", fallback: "",
+      placeholder: "Google Maps", hint: "{lat} and {lon} are filled in" }
+  ]}
+]
+
+function settingRow(key) {
+  for (var s = 0; s < SETTINGS.length; s++) {
+    var rows = SETTINGS[s].rows
+    for (var r = 0; r < rows.length; r++) if (rows[r].key === key) return rows[r]
+  }
+  return null
+}
+
+// A multi-value setting. Stored as an array, but it may arrive as a string:
+// `omarchy bar set` splits its own arguments on commas, so a list typed at a
+// terminal has to be space-separated, and a hand-edited shell.json is as
+// likely to use commas. Both read the same here.
+function choiceList(value) {
+  var list = Array.isArray(value)
+    ? value
+    : String(value === null || value === undefined ? "" : value).split(/[,\s]+/)
+  return list.map(function(v) { return String(v).replace(/^\s+|\s+$/g, "") })
+             .filter(function(v) { return v !== "" })
+}
+
+// A stored value as the widget should use it: absent, out of range or simply
+// wrong reads as the default rather than breaking the panel.
+function coerceSetting(row, raw) {
+  if (!row) return raw
+  var missing = raw === undefined || raw === null
+  if (row.kind === "toggle") {
+    if (missing || raw === "") return row.fallback === true
+    // shell.json may hold a real boolean from this page, or the word a
+    // hand-edit or `omarchy bar set` left there.
+    return raw === true || ["true", "on", "yes", "1"].indexOf(String(raw).toLowerCase()) !== -1
+  }
+  if (row.kind === "number") {
+    var n = parseInt(raw, 10)
+    if (!isFinite(n)) n = row.fallback
+    return Math.max(row.min, Math.min(row.max, n))
+  }
+  if (row.kind === "multi") {
+    var allowed = row.options.map(function(o) { return o.value })
+    // Unset means the default selection, which is a named list rather than
+    // every option: a control added later does not barge into the panel.
+    if (missing || raw === "") return row.fallback.slice()
+    return choiceList(raw).filter(function(v) { return allowed.indexOf(v) !== -1 })
+  }
+  if (row.kind === "choice") {
+    var picked = String(missing ? row.fallback : raw)
+    return row.options.some(function(o) { return o.value === picked }) ? picked : row.fallback
+  }
+  return String(missing ? "" : raw)
+}
+
+function readSetting(settings, key) {
+  return coerceSetting(settingRow(key), settings ? settings[key] : undefined)
+}
+
+// Is this what the widget would do anyway? A multi that holds every option
+// counts, so "all of them" keeps meaning all of them as options are added.
+function isDefaultSetting(row, value) {
+  if (!row) return false
+  if (row.kind === "multi") {
+    if (value === null || value === undefined) return true
+    var chosen = choiceList(value)
+    return chosen.length === row.fallback.length
+      && row.fallback.every(function(v) { return chosen.indexOf(v) !== -1 })
+  }
+  if (row.kind === "text") return String(value === null || value === undefined ? "" : value)
+    .replace(/^\s+|\s+$/g, "") === ""
+  return value === row.fallback
+}
+
+// The whole shell.json entry a change leaves behind. updateEntryInline
+// replaces the entry rather than merging into it, so every other key has to
+// be carried across; a value back at its default is dropped instead of
+// written. `changes` of null clears every option this page owns.
+function nextEntry(settings, id, changes) {
+  var entry = { id: String(id || "") }
+  for (var existing in settings) if (existing !== "id") entry[existing] = settings[existing]
+  if (changes === null) {
+    for (var s = 0; s < SETTINGS.length; s++)
+      SETTINGS[s].rows.forEach(function(row) { delete entry[row.key] })
+    return entry
+  }
+  for (var key in changes) {
+    var row = settingRow(key)
+    var value = changes[key]
+    if (row && isDefaultSetting(row, value)) delete entry[key]
+    else if (row && row.kind === "text") entry[key] = String(value).replace(/^\s+|\s+$/g, "")
+    else entry[key] = value
+  }
+  return entry
+}
+
+// Does any option differ from the default? Drives the "Reset" button.
+function hasCustomSettings(settings) {
+  for (var s = 0; s < SETTINGS.length; s++) {
+    var rows = SETTINGS[s].rows
+    for (var r = 0; r < rows.length; r++) {
+      var raw = settings ? settings[rows[r].key] : undefined
+      if (raw !== undefined && raw !== null && !isDefaultSetting(rows[r], coerceSetting(rows[r], raw)))
+        return true
+    }
+  }
+  return false
+}
+
+// Flipping one box in a multi. An unset setting means the default selection,
+// so the first box ticked has to start from that; the result keeps the spec's
+// order so the panel does not reshuffle as boxes are ticked.
+function toggleChoice(row, value, option) {
+  var all = row.options.map(function(o) { return o.value })
+  var current = value === null || value === undefined ? row.fallback.slice() : choiceList(value)
+  if (current.indexOf(option) !== -1)
+    return current.filter(function(v) { return v !== option })
+  return all.filter(function(v) { return v === option || current.indexOf(v) !== -1 })
+}
+
+// How tall a row renders, near enough to balance columns by. A text field or
+// a wrapping row of chips takes noticeably more than a switch.
+var ROW_WEIGHT = { text: 3, multi: 3, choice: 2, number: 2, toggle: 2 }
+
+function sectionWeight(section) {
+  return section.rows.reduce(function(sum, row) {
+    return sum + (ROW_WEIGHT[row.kind] || 2)
+  }, 1)
+}
+
+// The sections dealt into `count` columns, in order, so that the tallest
+// column comes out as short as it can. The overlay exists to put every option
+// on screen at once, and that only works if the columns are level.
+function settingsColumns(count) {
+  var wanted = Math.max(1, Math.min(Math.round(count) || 1, SETTINGS.length))
+  var weights = SETTINGS.map(sectionWeight)
+  var best = null
+
+  function tallestOf(cuts) {
+    var tallest = 0
+    var from = 0
+    for (var i = 0; i < cuts.length; i++) {
+      var sum = 0
+      for (var j = from; j < cuts[i]; j++) sum += weights[j]
+      if (sum > tallest) tallest = sum
+      from = cuts[i]
+    }
+    return tallest
+  }
+
+  // Only contiguous splits, so the sections stay in the order they are read.
+  function walk(start, left, cuts) {
+    if (left === 1) {
+      var all = cuts.concat([SETTINGS.length])
+      var tallest = tallestOf(all)
+      if (best === null || tallest < best.tallest) best = { tallest: tallest, cuts: all }
+      return
+    }
+    for (var cut = start + 1; cut <= SETTINGS.length - (left - 1); cut++)
+      walk(cut, left - 1, cuts.concat([cut]))
+  }
+  walk(0, wanted, [])
+
+  var columns = []
+  var from = 0
+  for (var i = 0; i < best.cuts.length; i++) {
+    columns.push(SETTINGS.slice(from, best.cuts[i]))
+    from = best.cuts[i]
+  }
+  return columns
+}
+
+// This widget's entry in the bar config the shell hands a plugin, which is
+// where the overlay reads the settings it is about to change. A widget that
+// is not in the layout has no entry yet; it behaves as an empty one, and the
+// first write puts it wherever the shell keeps it.
+function entryFor(barConfig, id) {
+  var layout = barConfig && barConfig.layout ? barConfig.layout : {}
+  var wanted = String(id || "")
+  var sections = ["left", "center", "right"]
+  for (var s = 0; s < sections.length; s++) {
+    var arr = layout[sections[s]] || []
+    for (var i = 0; i < arr.length; i++) {
+      // Clones carry a "#2" suffix; the id in front of it is the plugin's.
+      if (arr[i] && String(arr[i].id || "").split("#")[0] === wanted) return arr[i]
+    }
+  }
+  return { id: wanted }
+}
+
+// What a multi keeps from `list`, in the list's own order. An empty selection
+// keeps nothing; null is only reached before a setting has been read.
+function enabledOnly(list, chosen) {
+  if (chosen === null || chosen === undefined) return list
+  var keep = choiceList(chosen)
+  return (list || []).filter(function(item) { return keep.indexOf(item.id) !== -1 })
+}
+
+// One line under the page title: what is not at its default, or that nothing
+// is. Short enough to share the header.
+function settingsSummary(settings) {
+  return hasCustomSettings(settings) ? "Changed from the defaults" : "All at their defaults"
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     number: number, useImperial: useImperial, groupThousands: groupThousands,
@@ -333,6 +682,14 @@ if (typeof module !== "undefined") {
     placeName: placeName, subtitle: subtitle, controls: controls, afterCommand: afterCommand,
     dataUpdated: dataUpdated, carName: carName, tessieStatus: tessieStatus,
     tileGrid: tileGrid, tileUrl: tileUrl, mapMaxZoom: mapMaxZoom,
-    mapAttribution: mapAttribution, mapsUrl: mapsUrl
+    mapAttribution: mapAttribution, mapsUrl: mapsUrl,
+    stats: stats, barLabel: barLabel, SETTINGS: SETTINGS, settingRow: settingRow,
+    choiceList: choiceList, coerceSetting: coerceSetting, readSetting: readSetting,
+    isDefaultSetting: isDefaultSetting, nextEntry: nextEntry,
+    hasCustomSettings: hasCustomSettings, enabledOnly: enabledOnly,
+    toggleChoice: toggleChoice, sectionWeight: sectionWeight,
+    CONTROL_DEFAULTS: CONTROL_DEFAULTS,
+    settingsColumns: settingsColumns, entryFor: entryFor,
+    settingsSummary: settingsSummary
   }
 }

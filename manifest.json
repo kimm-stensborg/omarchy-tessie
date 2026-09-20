@@ -6,13 +6,17 @@
   "author": "Kimm Stensborg",
   "license": "MIT",
   "description": "Locate and control your Tesla from the bar, through Tessie",
-  "kinds": ["bar-widget"],
+  "kinds": [
+    "bar-widget",
+    "overlay"
+  ],
   "entryPoints": {
-    "barWidget": "BarWidget.qml"
+    "barWidget": "BarWidget.qml",
+    "overlay": "SettingsOverlay.qml"
   },
   "barWidget": {
     "displayName": "Tessie",
-    "description": "Map, battery and vitals of your Tesla, with lock, climate, sentry, charge port, flash and honk",
+    "description": "Map, battery and vitals of your Tesla, with lock, climate, sentry, charge port, flash and honk, and a settings page to pick what shows",
     "category": "Info",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -21,13 +25,110 @@
       "mapZoom": 16
     },
     "schema": [
-      { "key": "name", "type": "string", "label": "Car name (empty uses the name set in the car, else the model)" },
-      { "key": "vin", "type": "string", "label": "VIN (empty uses the first car on the account)" },
-      { "key": "units", "type": "string", "label": "Units: metric, imperial, or empty to follow the car" },
-      { "key": "refreshMinutes", "type": "integer", "label": "Refresh interval while closed (minutes)", "min": 1, "max": 60, "step": 1, "defaultValue": 5 },
-      { "key": "mapZoom", "type": "integer", "label": "Map zoom (up to 16, or 19 with a CARTO key)", "min": 3, "max": 19, "step": 1, "defaultValue": 16 },
-      { "key": "cartoKey", "type": "string", "label": "CARTO basemaps key (free at carto.com/basemaps/apikey)" },
-      { "key": "mapsUrl", "type": "string", "label": "Maps link, with {lat} and {lon}" }
+      {
+        "key": "name",
+        "type": "string",
+        "label": "Car name (empty uses the name set in the car, else the model)"
+      },
+      {
+        "key": "vin",
+        "type": "string",
+        "label": "VIN (empty uses the first car on the account)"
+      },
+      {
+        "key": "units",
+        "type": "string",
+        "label": "Units: metric, imperial, or empty to follow the car"
+      },
+      {
+        "key": "barLabel",
+        "type": "enum",
+        "label": "Next to the T in the bar",
+        "options": [
+          "none",
+          "battery",
+          "range"
+        ],
+        "defaultValue": "none"
+      },
+      {
+        "key": "showMap",
+        "type": "enum",
+        "label": "Show the map",
+        "options": [
+          "on",
+          "off"
+        ],
+        "defaultValue": "on"
+      },
+      {
+        "key": "mapZoom",
+        "type": "integer",
+        "label": "Map zoom (up to 16, or 19 with a CARTO key)",
+        "min": 3,
+        "max": 19,
+        "step": 1,
+        "defaultValue": 16
+      },
+      {
+        "key": "stats",
+        "type": "string",
+        "label": "Vitals to show, comma separated: locked, sentry, odometer, tyres, inside, outside, chargeLimit, lastCharge, climate, software (empty shows all)"
+      },
+      {
+        "key": "controls",
+        "type": "string",
+        "label": "Controls to show, comma separated: lock, climate, sentry, port, flash, honk (empty shows all)"
+      },
+      {
+        "key": "confirmUnlock",
+        "type": "enum",
+        "label": "Ask before unlocking",
+        "options": [
+          "on",
+          "off"
+        ],
+        "defaultValue": "on"
+      },
+      {
+        "key": "showFooter",
+        "type": "enum",
+        "label": "Show the Tessie status footer",
+        "options": [
+          "on",
+          "off"
+        ],
+        "defaultValue": "on"
+      },
+      {
+        "key": "refreshMinutes",
+        "type": "integer",
+        "label": "Refresh interval while closed (minutes)",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5
+      },
+      {
+        "key": "demo",
+        "type": "enum",
+        "label": "Show a made-up car and never call Tessie",
+        "options": [
+          "off",
+          "on"
+        ],
+        "defaultValue": "off"
+      },
+      {
+        "key": "cartoKey",
+        "type": "string",
+        "label": "CARTO basemaps key (free at carto.com/basemaps/apikey)"
+      },
+      {
+        "key": "mapsUrl",
+        "type": "string",
+        "label": "Maps link, with {lat} and {lon}"
+      }
     ]
   }
 }

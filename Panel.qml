@@ -12,19 +12,21 @@ import "Model.js" as Model
 Panel {
   id: root
   moduleName: "io.github.kimm-stensborg.tessie"
-  ipcTarget: "io.github.kimm-stensborg.tessie"
+  // BarWidget.qml owns the IPC target: only the copy on the focused screen
+  // answers it, and there is one of these panels per monitor.
   manageIpc: false
 
   property var anchorItem: null
   property var hostWidget: null
+  readonly property var shell: hostWidget && hostWidget.shell ? hostWidget.shell : null
   property string pluginDir: ""
   // The bar identifies panels by the widget in its slot (BarWidget.qml).
   readonly property var barIdentity: hostWidget || root
 
   readonly property string cli: pluginDir + "/bin/tessie"
-  readonly property string vin: String(setting("vin", "") || "").trim()
+  readonly property string vin: Model.readSetting(settings, "vin")
   // The demo setting swaps the car for bin/tessie's made-up one.
-  readonly property bool demo: String(setting("demo", false)) === "true"
+  readonly property bool demo: Model.readSetting(settings, "demo")
   readonly property var cliEnvironment: {
     var env = {}
     if (vin !== "") env.TESSIE_VIN = vin
@@ -42,22 +44,33 @@ Panel {
   property string commandError: ""
   property int tokenPolls: 0
   property real now: Date.now() / 1000
-  readonly property string cartoKey: String(setting("cartoKey", "") || "").trim()
+  readonly property string cartoKey: Model.readSetting(settings, "cartoKey")
   readonly property int maxZoom: Model.mapMaxZoom(cartoKey)
-  property int zoom: Math.max(3, Math.min(maxZoom, parseInt(setting("mapZoom", 16), 10) || 16))
+  // The map's own zoom, which the wheel moves for the session; the setting is
+  // where it starts, so scrolling around does not rewrite shell.json.
+  property int zoom: Math.max(3, Math.min(maxZoom, Model.readSetting(settings, "mapZoom")))
+  onSettingsChanged: zoom = Math.max(3, Math.min(maxZoom, Model.readSetting(settings, "mapZoom")))
+
+  // ---- What the settings say. The page itself is SettingsOverlay.qml,
+  //      summoned by the gear, because a bar popup has no room for it.
+  readonly property bool showMap: Model.readSetting(settings, "showMap")
+  readonly property bool showFooter: Model.readSetting(settings, "showFooter")
+  readonly property bool confirmUnlock: Model.readSetting(settings, "confirmUnlock")
+  readonly property string barLabelMode: Model.readSetting(settings, "barLabel")
+  readonly property string barLabelText: Model.barLabel(snapshot, imperial, barLabelMode)
 
   // status.tessie.com, checked when the panel opens, at most every 2 minutes.
   property var tessie: Model.tessieStatus(null)
   property real tessieCheckedAt: 0
 
   readonly property var car: snapshot ? snapshot.state : null
-  readonly property string carName: Model.carName(car, setting("name", ""))
+  readonly property string carName: Model.carName(car, Model.readSetting(settings, "name"))
   readonly property real updatedAt: car ? (Model.dataUpdated(car) || 0) : 0
   readonly property var charge: car && car.charge_state ? car.charge_state : ({})
-  readonly property bool imperial: Model.useImperial(setting("units", ""),
+  readonly property bool imperial: Model.useImperial(Model.readSetting(settings, "units"),
     car && car.gui_settings ? car.gui_settings.gui_distance_units : "")
   readonly property string activity: Model.activity(snapshot)
-  readonly property int refreshMinutes: Math.max(1, parseInt(setting("refreshMinutes", 5), 10) || 5)
+  readonly property int refreshMinutes: Model.readSetting(settings, "refreshMinutes")
 
   readonly property var position: {
     var loc = snapshot && snapshot.location ? snapshot.location : {}
@@ -100,25 +113,10 @@ Panel {
     return carName + " · " + Model.formatPercent(charge.battery_level) + " · " + activity
   }
 
-  readonly property var stats: {
-    if (!car) return []
-    var vs = car.vehicle_state || {}
-    var cs = car.climate_state || {}
-    var tyres = Model.tyres(snapshot.tires, vs, imperial)
-    var last = snapshot.lastCharge
-    return [
-      { label: "locked", value: Model.yesNo(vs.locked) },
-      { label: "sentry", value: Model.onOff(vs.sentry_mode) },
-      { label: "odometer", value: Model.formatDistance(vs.odometer, imperial) },
-      { label: "tyres", value: tyres.text, warn: tyres.low },
-      { label: "inside", value: Model.formatTemp(cs.inside_temp, imperial) },
-      { label: "outside", value: Model.formatTemp(cs.outside_temp, imperial) },
-      { label: "charge limit", value: Model.formatPercent(charge.charge_limit_soc) },
-      { label: "last charge", value: last ? Model.formatEnergy(last.energy_added) : "—" },
-      { label: "climate", value: Model.onOff(cs.is_climate_on) },
-      { label: "software", value: vs.car_version ? String(vs.car_version).split(" ")[0] : "—" }
-    ]
-  }
+  readonly property var stats: Model.enabledOnly(Model.stats(snapshot, imperial),
+    Model.readSetting(settings, "stats"))
+  readonly property var controls: Model.enabledOnly(Model.controls(car, confirmUnlock),
+    Model.readSetting(settings, "controls"))
 
   function open() {
     now = Date.now() / 1000
@@ -135,6 +133,14 @@ Panel {
   function close() {
     armedCommand = ""
     root.controller.hide()
+  }
+
+  // The settings are a full overlay, so the popup gets out of the way first.
+  // The shell routes a summon of this plugin's id to its overlay entry point.
+  function openSettings() {
+    root.close()
+    var api = root.shell || (bar ? bar.shell : null)
+    if (api && typeof api.summon === "function") api.summon(root.moduleName, "{}")
   }
 
   function toggle() { opened ? close() : open() }
@@ -193,7 +199,7 @@ Panel {
 
   function openMaps() {
     if (!position) return
-    Qt.openUrlExternally(Model.mapsUrl(position.lat, position.lon, setting("mapsUrl", "")))
+    Qt.openUrlExternally(Model.mapsUrl(position.lat, position.lon, Model.readSetting(settings, "mapsUrl")))
     close()
   }
 
@@ -277,15 +283,6 @@ Panel {
     }
   }
 
-  IpcHandler {
-    target: root.ipcTarget
-
-    function open(): void { root.open() }
-    function close(): void { root.close() }
-    function toggle(): void { root.toggle() }
-    function refresh(): void { root.refresh() }
-  }
-
   KeyboardPanel {
     id: panel
     anchorItem: root.anchorItem
@@ -304,6 +301,7 @@ Panel {
       onTextKey: function(t) {
         if (t === "r") root.refresh()
         else if (t === "m") root.openMaps()
+        else if (t === "s") root.openSettings()
       }
 
       Flickable {
@@ -320,16 +318,16 @@ Panel {
           width: scroller.width
           spacing: Style.space(12)
 
-          // ---- Title and status dot.
+          // ---- Title, status dot, and the gear that flips the page over.
           Item {
             width: parent.width
-            height: Math.max(title.implicitHeight, statusRow.implicitHeight)
+            height: Math.max(title.implicitHeight, trailing.implicitHeight)
 
             Text {
               id: title
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
-              width: parent.width - statusRow.width - Style.space(12)
+              width: parent.width - trailing.width - Style.space(12)
               elide: Text.ElideRight
               textFormat: Text.PlainText
               text: (root.car ? root.carName : "Tessie").toUpperCase()
@@ -340,27 +338,61 @@ Panel {
             }
 
             Row {
-              id: statusRow
+              id: trailing
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
-              spacing: Style.space(6)
-              visible: statusText.text !== ""
+              spacing: Style.space(4)
 
-              Rectangle {
+              Row {
+                id: statusRow
+                rightPadding: Style.space(6)
                 anchors.verticalCenter: parent.verticalCenter
-                width: Style.space(7)
-                height: width
-                radius: width / 2
-                color: root.statusColor
+                spacing: Style.space(6)
+                visible: statusText.text !== ""
+
+                Rectangle {
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Style.space(7)
+                  height: width
+                  radius: width / 2
+                  color: root.statusColor
+                }
+
+                Text {
+                  id: statusText
+                  textFormat: Text.PlainText
+                  text: root.activity !== "unknown" ? root.activity : root.loading ? "fetching" : ""
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.bodySmall
+                }
               }
 
-              Text {
-                id: statusText
-                textFormat: Text.PlainText
-                text: root.activity !== "unknown" ? root.activity : root.loading ? "fetching" : ""
-                color: root.muted
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
+              // Refresh and settings: the two things that act on the panel
+              // rather than on the car, kept out of the grid of things that do.
+              Button {
+                anchors.verticalCenter: parent.verticalCenter
+                iconText: root.loading ? "\uf1ce" : "\uf021"
+                iconSpinning: root.loading
+                tooltipText: "Refresh"
+                iconSize: Style.font.bodySmall
+                horizontalPadding: Style.space(6)
+                verticalPadding: Style.space(4)
+                foreground: root.muted
+                fontFamily: root.fontFamily
+                onClicked: root.refresh()
+              }
+
+              Button {
+                anchors.verticalCenter: parent.verticalCenter
+                iconText: "\uf013"
+                tooltipText: "Settings"
+                iconSize: Style.font.bodySmall
+                horizontalPadding: Style.space(6)
+                verticalPadding: Style.space(4)
+                foreground: root.muted
+                fontFamily: root.fontFamily
+                onClicked: root.openSettings()
               }
             }
           }
@@ -397,7 +429,7 @@ Panel {
           // ---- Map: CARTO tiles around the car, marker in the middle.
           Rectangle {
             id: map
-            visible: !!root.car
+            visible: !!root.car && root.showMap
             width: parent.width
             height: Style.space(240)
             color: root.darkMap ? "#1d1f21" : "#e9e7e2"
@@ -617,12 +649,12 @@ Panel {
             }
           }
 
-          PanelSeparator { visible: !!root.car; foreground: root.fg }
+          PanelSeparator { visible: statsGrid.visible; foreground: root.fg }
 
           // ---- Vitals, two to a row.
           Grid {
             id: statsGrid
-            visible: !!root.car
+            visible: !!root.car && root.stats.length > 0
             width: parent.width
             columns: 2
             columnSpacing: Style.space(12)
@@ -657,18 +689,18 @@ Panel {
             }
           }
 
-          PanelSeparator { visible: !!root.car; foreground: root.fg }
+          PanelSeparator { visible: controlsGrid.visible; foreground: root.fg }
 
           // ---- Controls. Toggles show selected while on; unlocking asks twice.
           Grid {
             id: controlsGrid
-            visible: !!root.car
+            visible: !!root.car && root.controls.length > 0
             width: parent.width
             columns: 3
             spacing: Style.space(8)
 
             Repeater {
-              model: Model.controls(root.car)
+              model: root.controls
 
               Button {
                 required property var modelData
@@ -679,7 +711,7 @@ Panel {
                 selected: modelData.active
                 enabled: root.pendingCommand === "" || pending
                 opacity: enabled ? 1 : 0.5
-                iconText: pending ? "" : modelData.icon
+                iconText: pending ? "\uf1ce" : modelData.icon
                 iconSpinning: pending
                 text: armed ? "Sure?" : modelData.label
                 foreground: armed ? Color.urgent : root.fg
@@ -700,38 +732,11 @@ Panel {
             font.pixelSize: Style.font.bodySmall
           }
 
-          // ---- Footer actions.
-          Row {
-            visible: !!root.car
-            width: parent.width
-            spacing: Style.space(8)
-
-            Button {
-              width: (parent.width - parent.spacing) / 2
-              bordered: true
-              enabled: !!root.position
-              text: "Open in maps"
-              foreground: root.fg
-              fontFamily: root.fontFamily
-              onClicked: root.openMaps()
-            }
-
-            Button {
-              width: (parent.width - parent.spacing) / 2
-              bordered: true
-              text: "Refresh"
-              iconText: root.loading ? "" : ""
-              iconSpinning: root.loading
-              foreground: root.fg
-              fontFamily: root.fontFamily
-              onClicked: root.refresh()
-            }
-          }
-
-          PanelSeparator { foreground: root.fg }
+          PanelSeparator { visible: root.showFooter; foreground: root.fg }
 
           // ---- Tessie footer: service status, data age, and links out.
           Item {
+            visible: root.showFooter
             width: parent.width
             height: Math.max(tessieText.implicitHeight, linksRow.implicitHeight)
 

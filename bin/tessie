@@ -10,7 +10,10 @@
 #   tessie state             print one JSON snapshot of the car (never wakes it)
 #   tessie command <name>    send a command: lock, unlock, start_climate,
 #                            stop_climate, flash, honk, enable_sentry,
-#                            disable_sentry, open_charge_port, close_charge_port
+#                            disable_sentry, open_charge_port, close_charge_port,
+#                            start_charging, stop_charging, activate_front_trunk,
+#                            activate_rear_trunk, vent_windows, close_windows,
+#                            start_max_defrost, stop_max_defrost, wake
 #
 # state and command always print a single JSON object, {"ok": false, ...} on
 # failure, so the widget has exactly one thing to parse.
@@ -27,7 +30,10 @@ CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-tessie
 TOKEN_FILE=$CONFIG_DIR/token
 VIN_FILE=$CACHE_DIR/vin
 
-COMMANDS=(lock unlock start_climate stop_climate flash honk enable_sentry disable_sentry open_charge_port close_charge_port)
+COMMANDS=(lock unlock start_climate stop_climate flash honk enable_sentry disable_sentry
+          open_charge_port close_charge_port start_charging stop_charging
+          activate_front_trunk activate_rear_trunk vent_windows close_windows
+          start_max_defrost stop_max_defrost wake)
 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 TOKEN=""
