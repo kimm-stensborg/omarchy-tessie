@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.kimm-stensborg.tessie",
   "name": "Tessie",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": "Kimm Stensborg",
   "license": "MIT",
   "description": "Locate and control your Tesla from the bar, through Tessie",
