@@ -14,13 +14,15 @@
 #                            start_charging, stop_charging, activate_front_trunk,
 #                            activate_rear_trunk, vent_windows, close_windows,
 #                            start_max_defrost, stop_max_defrost, wake
+#   tessie prices            day-ahead spot (+ optional Datahub tariffs); needs
+#                            TESSIE_PRICE_PLAN from the widget (JSON URLs)
 #
-# state and command always print a single JSON object, {"ok": false, ...} on
-# failure, so the widget has exactly one thing to parse.
+# state, command and prices always print a single JSON object, {"ok": false, ...}
+# on failure, so the widget has exactly one thing to parse.
 #
 # Environment: TESSIE_TOKEN and TESSIE_VIN override the stored values,
 # TESSIE_API points at another server and TESSIE_NO_KEYRING=1 skips the
-# keyring (the tests use both).
+# keyring (the tests use both). TESSIE_PRICE_PLAN is the fetch plan for prices.
 
 set -uo pipefail
 
@@ -219,9 +221,71 @@ cmd_logout() {
   echo "Forgot the Tessie token."
 }
 
+# Download one Energi Data Service URL into $WORK/$1.json; null on failure.
+# Sequential on purpose: EDS rate-limits bursts. A 429 gets one short retry.
+# Never talks to Tessie — only api.energidataservice.dk via the plan from Model.js.
+fetch_eds() {
+  local name=$1 url=$2
+  if [[ -z $url || $url == null ]]; then
+    printf 'null\n' >"$WORK/$name.json"
+    return
+  fi
+  local code try
+  for try in 1 2; do
+    code=$(curl -sS --max-time "${TESSIE_TIMEOUT:-20}" -o "$WORK/$name.json" -w '%{http_code}' "$url" 2>/dev/null || true)
+    if [[ $code == 2* ]] && jq -e 'type == "object"' "$WORK/$name.json" >/dev/null 2>&1; then
+      return
+    fi
+    [[ $code == 429 && $try == 1 ]] && sleep 1 && continue
+    break
+  done
+  printf 'null\n' >"$WORK/$name.json"
+}
+
+# TESSIE_PRICE_PLAN is JSON from Model.priceFetchPlan: {day, spot, net, system,
+# transmission, elafgift}. Spot is required; the rest are null when unused.
+cmd_prices() {
+  local plan=${TESSIE_PRICE_PLAN:-}
+  [[ -n $plan ]] || fail "No price plan (TESSIE_PRICE_PLAN)" usage
+  jq -e 'type == "object" and (.spot | type == "string" and length > 0)' <<<"$plan" >/dev/null 2>&1 \
+    || fail "Price plan is unreadable" usage
+
+  local day spot net system transmission elafgift
+  day=$(jq -r '.day // empty' <<<"$plan")
+  spot=$(jq -r '.spot // empty' <<<"$plan")
+  net=$(jq -r '.net // empty' <<<"$plan")
+  system=$(jq -r '.system // empty' <<<"$plan")
+  transmission=$(jq -r '.transmission // empty' <<<"$plan")
+  elafgift=$(jq -r '.elafgift // empty' <<<"$plan")
+
+  fetch_eds spot "$spot"
+  fetch_eds net "$net"
+  fetch_eds system "$system"
+  fetch_eds transmission "$transmission"
+  fetch_eds elafgift "$elafgift"
+
+  jq -e 'type == "object" and (.records | type == "array")' "$WORK/spot.json" >/dev/null 2>&1 \
+    || fail "Spot prices are unreachable" network
+
+  jq -cn \
+    --arg day "$day" \
+    --slurpfile spot "$WORK/spot.json" \
+    --slurpfile net "$WORK/net.json" \
+    --slurpfile system "$WORK/system.json" \
+    --slurpfile transmission "$WORK/transmission.json" \
+    --slurpfile elafgift "$WORK/elafgift.json" \
+    '{ok: true, day: $day,
+      spot: $spot[0],
+      net: (if $net[0] == null then null else $net[0] end),
+      system: (if $system[0] == null then null else $system[0] end),
+      transmission: (if $transmission[0] == null then null else $transmission[0] end),
+      elafgift: (if $elafgift[0] == null then null else $elafgift[0] end)}'
+}
+
 case ${1:-} in
   state) cmd_state ;;
   command) shift; cmd_command "$@" ;;
+  prices) cmd_prices ;;
   vin) cmd_vin ;;
   login) cmd_login ;;
   logout) cmd_logout ;;

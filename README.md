@@ -130,6 +130,12 @@ which is the first line above.
 - a map centred on the car. Scroll to zoom, click to open it in a maps app.
 - the address, plus the speed or the charging power and time to full
 - battery level and range, with a tick at the charge limit
+- a 24-hour electricity price chart under the battery. Spot for DK1 or DK2
+  (auto picks from the car's position in Denmark), optionally plus your
+  netselskab's C-tariff, Energinet fees, elafgift and VAT. A summary line
+  shows the current price and the cheapest 3-hour window; click a bar for the
+  breakdown and an estimate to the charge limit. The cheapest window is tinted
+  green; the current hour is highlighted
 - locked, sentry, odometer, tyres, inside and outside temperature, charge
   limit, last charge, climate and software version
 - six control buttons. **Lock**, **climate**, **sentry**, **charge port**,
@@ -151,14 +157,18 @@ open.
 
 Click the gear in the panel's corner, or press `s`. The settings open in a
 window of their own rather than in the panel, which is only as wide as the
-bar popup: every option below is laid out at once, in columns, with nothing
-behind a tab or a scroll.
+bar popup.
 
 A change takes effect as you make it and is saved straight away, so there is
-nothing to confirm. A dot next to an option marks one that is no longer at
-its default, and **Reset** puts every one of them back. `Esc` or **Done**
-closes the window; changing a setting from a terminal while it is open moves
-the controls in it.
+nothing to confirm. The page has a left menu — **Car**, **Prices**, **Panel**,
+**Advanced** — and shows one section at a time, with a short blurb under the
+title. Reopening lands on the page you left. A long list (the netselskab) is
+a searchable field rather than a wall of buttons; vitals and controls show
+how many are selected (`6 / 12`). The fee chips stay hidden while the chart
+itself is off. A dot marks a change from the default (on the menu for a whole
+section, on the option itself too), and **Reset** puts every one of them back.
+`↑`/`↓` switch page, `Esc` or **Done** closes; changing a setting from a
+terminal while it is open moves the controls in it.
 
 | Key              | Default                  | Meaning                                       |
 |------------------|--------------------------|-----------------------------------------------|
@@ -172,6 +182,10 @@ the controls in it.
 | `controls`       | the first six            | Which control buttons to show                 |
 | `confirmUnlock`  | on                       | Unlocking asks for a second click             |
 | `showFooter`     | on                       | Show the Tessie status footer                 |
+| `showPrices`     | on                       | Show the price chart under the battery        |
+| `priceArea`      | `auto`                   | Spot zone: `auto`, `DK1` or `DK2`             |
+| `priceGrid`      | `none`                   | Netselskab C-tariff, or `none` for spot only  |
+| `priceParts`     | energinet elafgift vat   | Extras on top of spot (and grid, if set)      |
 | `refreshMinutes` | `5`                      | Poll interval while the panel is closed       |
 | `demo`           | off                      | Show a made-up car and never call Tessie      |
 | `cartoKey`       | none                     | Use CARTO's basemaps, see [Map](#map)         |
@@ -186,6 +200,12 @@ twelve is four rows of buttons under the vitals. The rest are there to swap
 in rather than to pile on, and the buttons keep the order above however you
 tick them.
 
+`priceGrid` is your **netselskab**, not your elselskab: TREFOR El-net if you
+are on EWII in the Triangle area, Radius in and around Copenhagen, and so on.
+`none` keeps the chart on spot alone. `priceParts` picks from `energinet`
+(system + transmission), `elafgift` and `vat`, and includes all three unless
+you say otherwise.
+
 An option left at its default stays out of `shell.json` entirely, which is
 what the settings page's dot and **Reset** are reading.
 
@@ -196,6 +216,8 @@ be set from a script as well:
 omarchy bar set io.github.kimm-stensborg.tessie name "Sparky"
 omarchy bar set io.github.kimm-stensborg.tessie demo true --json
 omarchy bar set io.github.kimm-stensborg.tessie controls "lock honk"
+omarchy bar set io.github.kimm-stensborg.tessie priceGrid trefor
+omarchy bar set io.github.kimm-stensborg.tessie priceParts "energinet vat"
 omarchy bar set io.github.kimm-stensborg.tessie mapsUrl "https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=17/{lat}/{lon}"
 ```
 
@@ -229,10 +251,13 @@ Nothing else on the system is touched. It contacts:
 - `api.tessie.com`: the car's state, and the commands you send
 - `status.tessie.com`: Tessie's service status, when the panel opens and at
   most every two minutes
+- `api.energidataservice.dk`: day-ahead spot prices (DayAheadPrices) and, when
+  a grid company or price parts are set, Datahub tariffs (DatahubPricelist)
 - `server.arcgisonline.com`, or `basemaps.cartocdn.com` with a CARTO key: map
   tiles
 
-With `demo` on, no request goes to `api.tessie.com`.
+With `demo` on, no request goes to `api.tessie.com`. The price chart still
+asks Energi Data Service.
 
 ## Command line
 
@@ -244,6 +269,7 @@ bin/tessie login              store a Tessie API token
 bin/tessie logout             forget it
 bin/tessie vin                print the VIN in use
 bin/tessie state              one JSON snapshot of the car
+bin/tessie prices             day-ahead spot (+ tariffs); needs TESSIE_PRICE_PLAN
 bin/tessie command lock       lock, unlock, start_climate, stop_climate, flash,
                               honk, enable_sentry, disable_sentry,
                               open_charge_port, close_charge_port,
@@ -263,7 +289,7 @@ car.
 | `BarWidget.qml` | the bar button, with the Tesla **T** drawn on a canvas |
 | `Panel.qml` | the panel: map, vitals, controls, footer |
 | `SettingsOverlay.qml` | the settings window behind the gear: the card, and the writes |
-| `SettingsColumn.qml` | one column of it, a row per option |
+| `SettingsColumn.qml` | the options for the active left-menu page |
 | `Model.js` | units, formatting, status, controls, the settings spec and map tile math |
 | `bin/tessie` | `login`, `state` and `command`: the only code that talks to Tessie or touches the token |
 | `test.sh` | the tests |
@@ -307,4 +333,5 @@ fails too.
 Map tiles © Esri, HERE, Garmin and
 [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors, or with
 a key © [OpenStreetMap](https://www.openstreetmap.org/copyright) contributors
-© [CARTO](https://carto.com/attributions).
+© [CARTO](https://carto.com/attributions). Day-ahead prices ©
+[Energinet](https://www.energidataservice.dk) (CC BY 4.0).

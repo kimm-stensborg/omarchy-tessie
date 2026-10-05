@@ -9,9 +9,9 @@ import "Model.js" as Model
 // Tessie's settings, in a window of their own.
 //
 // The panel is a bar popup and stays narrow, which is right for a map and six
-// buttons and wrong for fourteen options. So the gear summons this instead: a
-// card wide enough to lay every option out at once, in columns Model levels
-// so none of them runs long. Nothing here is behind a tab or a scroll.
+// buttons and wrong for a page of options. So the gear summons this instead:
+// a card with a left menu (Car, Prices, Panel, Advanced) and one section at
+// a time on the right. Long lists (netselskab) stay a searchable dropdown.
 //
 // It writes each change through updateEntryInline, the same path
 // `omarchy bar set` takes. There is no Save: a change is live in the bar
@@ -35,12 +35,17 @@ Item {
   readonly property string configPath: Quickshell.env("HOME") + "/.config/omarchy/shell.json"
 
   property bool opened: false
+  property int sectionIndex: 0
+  // Survives close so reopening lands on the page you left.
+  property int lastSectionIndex: 0
 
   // This widget's entry, as shell.json currently has it. A write sets it here
   // first so the control redraws on the click itself, and the file watcher
   // confirms it a moment later with whatever was actually stored.
   property var settings: ({ id: root.pluginId })
   readonly property bool customised: Model.hasCustomSettings(root.settings)
+  readonly property var sections: Model.SETTINGS
+  readonly property var currentSection: sections[Math.max(0, Math.min(sectionIndex, sections.length - 1))] || null
 
   function takeConfig(text) {
     var parsed = null
@@ -73,48 +78,41 @@ Item {
   readonly property string fontFamily: Style.font.menuFamily
   readonly property int contentMargin: Style.spacing.panelPadding
 
-  // Three columns at a desktop width, two when the card is squeezed, one on
-  // something small. The card follows the content rather than the other way
-  // round, so a narrow screen gets a narrow card and not a cramped one.
-  readonly property int columnCount: panel.width >= Style.space(1120) ? 3
-    : panel.width >= Style.space(780) ? 2 : 1
-  readonly property int columnWidth: Style.space(300)
-  readonly property var columns: Model.settingsColumns(root.columnCount)
-
-  readonly property int columnGap: Style.space(28)
+  readonly property int navWidth: Style.space(220)
+  readonly property int pageWidth: Style.space(420)
+  readonly property int navGap: Style.space(28)
   readonly property int cardWidth: Math.min(
-    root.columnWidth * root.columnCount + root.columnGap * (root.columnCount - 1) + root.contentMargin * 2,
+    root.navWidth + root.navGap + root.pageWidth + root.contentMargin * 2,
     panel.width - Style.gapsOut * 2)
-
-  // The gaps around the two rules, named because the card's height is the
-  // options plus exactly this much and nothing else: get it wrong and the
-  // last row of the tallest column is quietly clipped.
   readonly property int ruleGap: Style.space(14)
   readonly property int bodyGap: Style.space(16)
-  readonly property int chromeHeight: root.contentMargin * 2
-    + header.height + footer.height
-    + headerRule.height + footerRule.height
-    + root.ruleGap * 3 + root.bodyGap
+  // Fixed height so switching pages does not resize the card.
+  readonly property int cardHeight: Math.min(Style.space(720), panel.height - Style.gapsOut * 2)
 
-  // The card is as tall as the options need, and no taller, until the screen
-  // runs out — then the columns scroll.
-  readonly property int cardHeight: Math.min(root.chromeHeight + columnsRow.implicitHeight,
-    panel.height - Style.gapsOut * 2)
-
-  // A text field in any column owns the keyboard while it has it.
+  // A text field or search dropdown owns the keyboard while it has it.
   property bool editing: false
 
   function open(payloadJson) {
     root.opened = true
+    root.sectionIndex = Math.max(0, Math.min(root.lastSectionIndex, root.sections.length - 1))
+    root.editing = false
     configFile.reload()
     Qt.callLater(function() { if (keyCatcher) keyCatcher.forceActiveFocus() })
   }
 
   function close() {
+    root.lastSectionIndex = root.sectionIndex
     root.opened = false
   }
 
   function toggle() { root.opened ? root.close() : root.open("{}") }
+
+  function goSection(delta) {
+    if (root.editing || root.sections.length === 0) return
+    var next = root.sectionIndex + delta
+    if (next < 0 || next >= root.sections.length) return
+    root.sectionIndex = next
+  }
 
   // One option, written to this widget's entry in shell.json. Model.nextEntry
   // carries every other key across — updateEntryInline replaces the entry
@@ -185,6 +183,12 @@ Item {
           if (event.key === Qt.Key_Escape) {
             root.close()
             event.accepted = true
+          } else if (event.key === Qt.Key_Up || event.key === Qt.Key_K) {
+            root.goSection(-1)
+            event.accepted = true
+          } else if (event.key === Qt.Key_Down || event.key === Qt.Key_J) {
+            root.goSection(1)
+            event.accepted = true
           }
         }
 
@@ -206,7 +210,7 @@ Item {
 
             Text {
               textFormat: Text.PlainText
-              text: "Tessie"
+              text: "Tessie settings"
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.title
@@ -217,8 +221,8 @@ Item {
               elide: Text.ElideRight
               textFormat: Text.PlainText
               text: root.customised
-                ? "Changed from the defaults · saved as you go, in ~/.config/omarchy/shell.json"
-                : "Every option is at its default · saved as you go, in ~/.config/omarchy/shell.json"
+                ? "Changed from the defaults · saved as you go"
+                : "All at their defaults · saved as you go"
               color: root.muted
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -250,8 +254,8 @@ Item {
           foreground: root.foreground
         }
 
-        // ---- The options. Every one of them, at once.
-        Flickable {
+        // ---- Left menu + one section.
+        Item {
           id: body
           anchors.top: headerRule.bottom
           anchors.topMargin: root.bodyGap
@@ -259,33 +263,120 @@ Item {
           anchors.bottomMargin: root.ruleGap
           anchors.left: parent.left
           anchors.right: parent.right
-          contentWidth: width
-          contentHeight: columnsRow.implicitHeight
-          clip: true
-          boundsBehavior: Flickable.StopAtBounds
-          interactive: contentHeight > height
 
-          Row {
-            id: columnsRow
-            width: body.width
-            spacing: root.columnGap
+          Column {
+            id: nav
+            width: root.navWidth
+            anchors.left: parent.left
+            anchors.top: parent.top
+            spacing: Style.space(4)
 
             Repeater {
-              model: root.columns
+              model: root.sections
+
+              Button {
+                required property var modelData
+                required property int index
+                width: nav.width
+                leftAlign: true
+                bordered: false
+                selected: index === root.sectionIndex
+                text: modelData.title
+                fontSize: Style.font.body
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+                horizontalPadding: Style.space(16)
+                verticalPadding: Style.space(14)
+                onClicked: root.sectionIndex = index
+
+                Rectangle {
+                  anchors.right: parent.right
+                  anchors.rightMargin: Style.space(14)
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: Style.space(7)
+                  height: width
+                  radius: width / 2
+                  color: root.accent
+                  opacity: Model.sectionHasCustom(modelData, root.settings) ? 0.9 : 0
+                }
+              }
+            }
+          }
+
+          Rectangle {
+            id: navRule
+            width: Math.max(1, Style.space(1))
+            anchors.left: nav.right
+            anchors.leftMargin: root.navGap / 2 - width / 2
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+            color: Util.alpha(root.foreground, 0.12)
+          }
+
+          Item {
+            id: page
+            anchors.left: nav.right
+            anchors.leftMargin: root.navGap
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.bottom: parent.bottom
+
+            Column {
+              id: pageHeader
+              anchors.top: parent.top
+              anchors.left: parent.left
+              anchors.right: parent.right
+              spacing: Style.space(4)
+
+              Text {
+                id: pageTitle
+                width: parent.width
+                textFormat: Text.PlainText
+                text: root.currentSection ? root.currentSection.title : ""
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                font.bold: true
+              }
+
+              Text {
+                id: pageBlurb
+                visible: !!(root.currentSection && root.currentSection.blurb)
+                width: parent.width
+                wrapMode: Text.Wrap
+                textFormat: Text.PlainText
+                text: root.currentSection && root.currentSection.blurb
+                  ? root.currentSection.blurb : ""
+                color: root.muted
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+            }
+
+            Flickable {
+              id: pageScroll
+              anchors.top: pageHeader.bottom
+              anchors.topMargin: Style.space(14)
+              anchors.bottom: parent.bottom
+              anchors.left: parent.left
+              anchors.right: parent.right
+              contentWidth: width
+              contentHeight: pageColumn.implicitHeight
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+              interactive: contentHeight > height
 
               SettingsColumn {
-                required property var modelData
-                width: (columnsRow.width - root.columnGap * (root.columnCount - 1)) / root.columnCount
-                sections: modelData
+                id: pageColumn
+                width: pageScroll.width
+                sections: root.currentSection ? [root.currentSection] : []
                 values: root.settings
+                showHeaders: false
                 fg: root.foreground
                 muted: root.muted
                 accent: root.accent
                 fontFamily: root.fontFamily
 
-                // One field at a time across the whole card: a column only
-                // knows about its own, so the card tracks whether any of them
-                // has the keyboard.
                 onEditingChanged: root.editing = editing
                 onChanged: function(key, value) { root.persist(key, value) }
                 onFocusReleased: {
@@ -321,7 +412,7 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             elide: Text.ElideRight
             textFormat: Text.PlainText
-            text: "Esc closes · a dot marks an option that is no longer the default"
+            text: "↑↓ switch page · Esc closes · a dot marks a change"
             color: root.muted
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption

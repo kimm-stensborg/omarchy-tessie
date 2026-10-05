@@ -184,6 +184,52 @@ out=$(TESSIE_DEMO=1 "$CLI" command bogus 2>&1)
 is  "demo still refuses unknown ones" "$(jq -r .code <<<"$out")" usage
 is  "demo never calls Tessie"        "$(log)" ""
 
+echo "prices"
+# A tiny Energi Data Service stand-in: DayAheadPrices vs DatahubPricelist.
+cat >"$WORK/eds.py" <<'PY'
+import http.server, json, urllib.parse
+SPOT = {"records": [
+  {"TimeDK": "2026-10-04T00:00:00", "PriceArea": "DK2", "DayAheadPriceDKK": 1000},
+  {"TimeDK": "2026-10-04T00:15:00", "PriceArea": "DK2", "DayAheadPriceDKK": 1000},
+  {"TimeDK": "2026-10-04T00:30:00", "PriceArea": "DK2", "DayAheadPriceDKK": 1000},
+  {"TimeDK": "2026-10-04T00:45:00", "PriceArea": "DK2", "DayAheadPriceDKK": 1000},
+]}
+NET = {"records": [{
+  "ValidFrom": "2026-10-01T00:00:00", "ValidTo": "2027-01-01T00:00:00",
+  "ChargeTypeCode": "C", "Note": "Nettarif C", "Price1": 0.1
+}]}
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        body = SPOT if "DayAheadPrices" in path else NET
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def log_message(self, *args): pass
+s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+open(__import__("os").path.join(__import__("sys").argv[1], "eds.port"), "w").write(str(s.server_address[1]))
+s.serve_forever()
+PY
+python3 "$WORK/eds.py" "$WORK" & EDS=$!
+trap 'kill $MOCK $EDS 2>/dev/null; rm -rf "$WORK"' EXIT
+for _ in $(seq 50); do [[ -s $WORK/eds.port ]] && break; sleep 0.1; done
+EDS_URL="http://127.0.0.1:$(<"$WORK/eds.port")"
+plan=$(jq -cn --arg d 2026-10-04 --arg s "$EDS_URL/dataset/DayAheadPrices" --arg n "$EDS_URL/dataset/DatahubPricelist" \
+  '{day:$d, spot:$s, net:$n, system:null, transmission:null, elafgift:null}')
+out=$(TESSIE_PRICE_PLAN="$plan" "$CLI" prices 2>&1)
+is  "prices is ok"                   "$(jq -r .ok <<<"$out")" true
+is  "prices keeps the day"           "$(jq -r .day <<<"$out")" 2026-10-04
+is  "prices has spot records"        "$(jq -r '.spot.records | length' <<<"$out")" 4
+is  "prices has net records"         "$(jq -r '.net.records | length' <<<"$out")" 1
+out=$(TESSIE_PRICE_PLAN= "$CLI" prices 2>&1); code=$?
+is  "prices without a plan fails"    "$(jq -r .code <<<"$out")" usage
+is  "and exits non-zero"             "$code" 1
+kill $EDS 2>/dev/null; wait $EDS 2>/dev/null; EDS=
+trap 'kill $MOCK 2>/dev/null; rm -rf "$WORK"' EXIT
+
 echo "login"
 out=$(printf 'bad-token\n' | "$CLI" login 2>&1); code=$?
 has "a bad token is not stored"      "$out" "rejected that token"
@@ -411,7 +457,7 @@ const cases = [
   ["three columns keep order", M.settingsColumns(3).flat().map(s => s.title).join(" | "),
      M.SETTINGS.map(s => s.title).join(" | ")],
   ["three columns are level", M.settingsColumns(3).map(c =>
-     c.reduce((n, s) => n + M.sectionWeight(s), 0)).join(","), "12,15,12"],
+     c.reduce((n, s) => n + M.sectionWeight(s), 0)).join(","), "19,17,11"],
   ["columns lose nothing",  M.settingsColumns(2).flat().length, M.SETTINGS.length],
   ["no column is empty",    M.settingsColumns(3).every(c => c.length > 0), true],
   ["more columns than sections", M.settingsColumns(99).length, M.SETTINGS.length],
@@ -421,7 +467,130 @@ const cases = [
   ["missing entry is bare", JSON.stringify(M.entryFor({layout: {right: []}}, "t")), '{"id":"t"}'],
   ["no config is bare",     JSON.stringify(M.entryFor(null, "t")), '{"id":"t"}'],
   ["defaults read off a bare entry", M.readSetting(M.entryFor(null, "t"), "showMap"), true],
+  ["spot price",         M.formatSpotPrice(1531.863799), "1.53 kr/kWh"],
+  ["spot negative",      M.formatSpotPrice(-120), "-0.12 kr/kWh"],
+  ["spot missing",       M.formatSpotPrice(null), "—"],
+  ["hour range",         M.hourRangeLabel(14), "14:00–15:00"],
+  ["hour range wraps",   M.hourRangeLabel(23), "23:00–00:00"],
+  ["calendar day",       M.calendarDay(new Date(2026, 9, 4, 15, 30)), "2026-10-04"],
+  ["next calendar day",  M.nextCalendarDay("2026-10-04"), "2026-10-05"],
+  ["prices url DK2",     M.pricesUrl("DK2", "2026-10-04").includes('PriceArea') && M.pricesUrl("DK2", "2026-10-04").includes("DK2") && M.pricesUrl("DK2", "2026-10-04").includes("2026-10-04T00%3A00"), true],
+  ["prices url defaults east", M.pricesUrl("west", "2026-10-04").includes("DK2"), true],
+  ["bar fraction zero",  M.priceBarFraction(0, 0, 1000), 0],
+  ["bar fraction mid",   M.priceBarFraction(500, 0, 1000), 0.5],
+  ["bar fraction flat",  M.priceBarFraction(100, 100, 100), 0.5],
+  ["bar fraction null",  M.priceBarFraction(null, 0, 1000), 0],
 ]
+
+const priceRaw = {
+  records: [
+    { TimeDK: "2026-10-04T00:00:00", PriceArea: "DK2", DayAheadPriceDKK: 1000 },
+    { TimeDK: "2026-10-04T00:15:00", PriceArea: "DK2", DayAheadPriceDKK: 1200 },
+    { TimeDK: "2026-10-04T00:30:00", PriceArea: "DK2", DayAheadPriceDKK: 800 },
+    { TimeDK: "2026-10-04T00:45:00", PriceArea: "DK2", DayAheadPriceDKK: 1000 },
+    { TimeDK: "2026-10-04T01:00:00", PriceArea: "DK2", DayAheadPriceDKK: 2000 },
+    { TimeDK: "2026-10-04T01:15:00", PriceArea: "DK2", DayAheadPriceDKK: 2000 },
+    { TimeDK: "2026-10-04T01:30:00", PriceArea: "DK2", DayAheadPriceDKK: 2000 },
+    { TimeDK: "2026-10-04T01:45:00", PriceArea: "DK2", DayAheadPriceDKK: 2000 },
+    { TimeDK: "2026-10-04T14:00:00", PriceArea: "DK2", DayAheadPriceDKK: 500 },
+    { TimeDK: "2026-10-04T14:15:00", PriceArea: "DK2", DayAheadPriceDKK: 500 },
+    { TimeDK: "2026-10-04T14:30:00", PriceArea: "DK2", DayAheadPriceDKK: 500 },
+    { TimeDK: "2026-10-04T14:45:00", PriceArea: "DK2", DayAheadPriceDKK: 500 },
+    { TimeDK: "2026-10-05T00:00:00", PriceArea: "DK2", DayAheadPriceDKK: 9999 }
+  ]
+}
+const chart = M.dayPrices(priceRaw, "2026-10-04", { currentHour: 14 })
+cases.push(["day prices averages the quarter-hours", chart.bars[0].price, 1000])
+cases.push(["day prices keeps the hour", chart.bars[1].price, 2000])
+cases.push(["day prices skips other days", chart.bars.every(b => b.hour !== 0 || b.price === 1000), true])
+cases.push(["day prices has 24 bars", chart.bars.length, 24])
+cases.push(["day prices marks current", chart.bars[14].current, true])
+cases.push(["day prices marks cheapest", chart.bars[14].cheapest, true])
+cases.push(["day prices marks dearest", chart.bars[1].dearest, true])
+cases.push(["day prices tip has the price", chart.bars[14].tip.includes("0.50 kr/kWh") && chart.bars[14].tip.includes("14:00"), true])
+cases.push(["day prices empty raw", M.dayPrices("", "2026-10-04").bars.length, 0])
+cases.push(["prices setting on by default", M.readSetting({}, "showPrices"), true])
+cases.push(["price area defaults to auto", M.readSetting({}, "priceArea"), "auto"])
+cases.push(["price area keeps DK1", M.readSetting({ priceArea: "DK1" }, "priceArea"), "DK1"])
+cases.push(["price area rejects junk", M.readSetting({ priceArea: "SE3" }, "priceArea"), "auto"])
+cases.push(["price grid defaults to spot only", M.readSetting({}, "priceGrid"), "none"])
+cases.push(["price grid keeps trefor", M.readSetting({ priceGrid: "trefor" }, "priceGrid"), "trefor"])
+cases.push(["price grid rejects junk", M.readSetting({ priceGrid: "ewii" }, "priceGrid"), "none"])
+cases.push(["price parts default to all three", M.readSetting({}, "priceParts").join(","), "energinet,elafgift,vat"])
+cases.push(["grid picker is searchable", M.choiceUsesSearch(M.settingRow("priceGrid")), true])
+cases.push(["short choice stays chips", M.choiceUsesSearch(M.settingRow("priceArea")), false])
+cases.push(["vitals use a checklist grid", M.multiUsesGrid(M.settingRow("stats")), true])
+cases.push(["price parts stay chips", M.multiUsesGrid(M.settingRow("priceParts")), false])
+cases.push(["vitals count label", M.multiSelectionLabel(M.settingRow("stats"), null), "10 / 10"])
+cases.push(["controls count default", M.multiSelectionLabel(M.settingRow("controls"), undefined), "6 / 12"])
+cases.push(["netselskab stays when chart off", M.settingVisible(M.settingRow("priceGrid"), { showPrices: false }), true])
+cases.push(["price parts hide when chart off", M.settingVisible(M.settingRow("priceParts"), { showPrices: false }), false])
+cases.push(["price parts show when chart on", M.settingVisible(M.settingRow("priceParts"), { showPrices: true }), true])
+cases.push(["sections are car prices panel advanced", M.SETTINGS.map(s => s.title).join("|"), "Car|Prices|Panel|Advanced"])
+cases.push(["prices section has a blurb", !!M.SETTINGS[1].blurb && M.SETTINGS[1].blurb.includes("netselskab"), true])
+cases.push(["section custom is noticed", M.sectionHasCustom(M.SETTINGS[1], { priceGrid: "trefor" }), true])
+cases.push(["section defaults are not", M.sectionHasCustom(M.SETTINGS[0], {}), false])
+cases.push(["denmark west is DK1", M.denmarkPriceArea(55.4, 10.4), "DK1"])
+cases.push(["denmark east is DK2", M.denmarkPriceArea(55.7, 12.6), "DK2"])
+cases.push(["outside denmark is null", M.denmarkPriceArea(52.1, 5.1), null])
+cases.push(["auto area follows the car", M.resolvePriceArea("auto", 55.4, 10.4), "DK1"])
+cases.push(["explicit area wins", M.resolvePriceArea("DK2", 55.4, 10.4), "DK2"])
+cases.push(["auto without coords falls back", M.resolvePriceArea("auto", null, null), "DK2"])
+cases.push(["kr/kWh", M.formatKrKwh(1.591), "1.59 kr/kWh"])
+cases.push(["trefor is in the grid list", !!M.GRID_COMPANIES.trefor && M.GRID_COMPANIES.trefor.gln === "5790000392261", true])
+cases.push(["fetch plan spot only", M.priceFetchPlan("DK2", "none", [], "2026-10-04").net, null])
+cases.push(["fetch plan trefor has net", !!M.priceFetchPlan("DK2", "trefor", [], "2026-10-04").net, true])
+cases.push(["fetch plan skips energinet", M.priceFetchPlan("DK2", "none", ["vat"], "2026-10-04").system, null])
+cases.push(["fetch plan wants elafgift", !!M.priceFetchPlan("DK2", "none", ["elafgift"], "2026-10-04").elafgift, true])
+
+function tariffRec(from, to, hoursOrFlat) {
+  const rec = { ValidFrom: from + "T00:00:00", ValidTo: to + "T00:00:00", ChargeTypeCode: "C", Note: "Nettarif C" }
+  if (Array.isArray(hoursOrFlat)) hoursOrFlat.forEach((p, i) => { rec["Price" + (i + 1)] = p })
+  else rec.Price1 = hoursOrFlat
+  return rec
+}
+const netHours = Array(24).fill(0.1); netHours[17] = 0.4
+const bundle = {
+  ok: true, day: "2026-10-04",
+  spot: priceRaw,
+  net: { records: [tariffRec("2026-10-01", "2027-01-01", netHours)] },
+  system: { records: [tariffRec("2026-01-01", "2027-01-01", 0.07)] },
+  transmission: { records: [tariffRec("2026-01-01", "2027-01-01", 0.06)] },
+  elafgift: { records: [tariffRec("2026-01-01", "2028-01-01", 0.01)] }
+}
+const spotOnly = M.consumerPrices(bundle, { day: "2026-10-04", grid: "none", parts: [], currentHour: 14 })
+const withAll = M.consumerPrices(bundle, { day: "2026-10-04", grid: "trefor", parts: ["energinet", "elafgift", "vat"], currentHour: 17 })
+// hour 14 spot 0.50 + no extras
+cases.push(["consumer spot only uses kr/kWh", spotOnly.bars[14].price, 0.5])
+cases.push(["consumer spot only has no grid label", spotOnly.grid, ""])
+// hour 17: spot  absent in fixture → null bar; use hour 1: spot 2.00 + net 0.1 + sys 0.07 + tr 0.06 + tax 0.01 = 2.24 * 1.25
+cases.push(["consumer adds tariffs and VAT", +withAll.bars[1].price.toFixed(4), 2.8])
+cases.push(["consumer labels TREFOR", withAll.grid, "TREFOR"])
+cases.push(["consumer tip breaks down", withAll.bars[1].tip.includes("spot") && withAll.bars[1].tip.includes("net") && withAll.bars[1].tip.includes("VAT"), true])
+cases.push(["price detail has a title", !!spotOnly.bars[14].detail && spotOnly.bars[14].detail.title.includes("14:00"), true])
+// Sparse spot fixture has gaps; a full day is needed for the 3-hour window.
+const denseRecords = []
+for (let h = 0; h < 24; h++) {
+  const dkk = h >= 2 && h <= 4 ? 400 : h === 17 ? 2200 : 1000 + h
+  denseRecords.push({ TimeDK: `2026-10-04T${String(h).padStart(2,"0")}:00:00`, PriceArea: "DK2", DayAheadPriceDKK: dkk })
+}
+const dense = M.consumerPrices({ ok: true, day: "2026-10-04", spot: { records: denseRecords } },
+  { day: "2026-10-04", grid: "none", parts: [], currentHour: 14 })
+cases.push(["consumer marks a 3h window", !!dense.window && dense.window.start === 2 && dense.window.end === 5, true])
+cases.push(["consumer window hours flagged", dense.bars.filter(b => b.inWindow).length, 3])
+cases.push(["price summary names now", M.priceSummary(dense, 14).includes("now") && M.priceSummary(dense, 14).includes("best"), true])
+cases.push(["cheapest window from now", M.cheapestWindow(dense.bars, 14, 3).start >= 14, true])
+const chargeSnap = { state: { charge_state: { battery_level: 50, charge_limit_soc: 80, battery_range: 150 } } }
+const chargeEst = M.chargeEstimate(chargeSnap, 2.0)
+cases.push(["charge estimate has kWh", !!chargeEst && chargeEst.kwh > 0, true])
+cases.push(["charge estimate labels limit", !!chargeEst && chargeEst.label.includes("80%"), true])
+cases.push(["pick tariff prefers current window", M.pickTariffRecord({ records: [
+  tariffRec("2026-04-01", "2026-10-01", 0.05),
+  tariffRec("2026-10-01", "2027-01-01", 0.12)
+]}, "2026-10-04").Price1, 0.12])
+cases.push(["tariff hours fill from Price1", M.tariffHours(tariffRec("2026-01-01", "2027-01-01", 0.07))[17], 0.07])
+cases.push(["tariff hours keep the peak", M.tariffHours(tariffRec("2026-01-01", "2027-01-01", netHours))[17], 0.4])
+
 // The marker is the viewport centre, so the tile under it must contain the
 // car's own tile coordinate at that spot.
 const grid = M.tileGrid(52.0907, 5.1214, 16, 380, 240)

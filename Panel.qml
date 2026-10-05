@@ -55,6 +55,10 @@ Panel {
   //      summoned by the gear, because a bar popup has no room for it.
   readonly property bool showMap: Model.readSetting(settings, "showMap")
   readonly property bool showFooter: Model.readSetting(settings, "showFooter")
+  readonly property bool showPrices: Model.readSetting(settings, "showPrices")
+  readonly property string priceArea: Model.readSetting(settings, "priceArea")
+  readonly property string priceGrid: Model.readSetting(settings, "priceGrid")
+  readonly property var priceParts: Model.readSetting(settings, "priceParts")
   readonly property bool confirmUnlock: Model.readSetting(settings, "confirmUnlock")
   readonly property string barLabelMode: Model.readSetting(settings, "barLabel")
   readonly property string barLabelText: Model.barLabel(snapshot, imperial, barLabelMode)
@@ -62,6 +66,49 @@ Panel {
   // status.tessie.com, checked when the panel opens, at most every 2 minutes.
   property var tessie: Model.tessieStatus(null)
   property real tessieCheckedAt: 0
+
+  // Day-ahead prices (+ optional tariffs) under the battery. Fetched even when
+  // the chart is off, so the summary line still has a number.
+  property var priceChart: ({ day: "", area: "", grid: "", bars: [], min: null, max: null, window: null })
+  property real pricesCheckedAt: 0
+  property int selectedPriceHour: -1
+  readonly property var priceBars: priceChart && priceChart.bars ? priceChart.bars : []
+  readonly property string resolvedPriceArea: {
+    var lat = position ? position.lat : null
+    var lon = position ? position.lon : null
+    return Model.resolvePriceArea(priceArea, lat, lon)
+  }
+  readonly property string priceTitle: {
+    var bits = []
+    if (priceChart.grid) bits.push(priceChart.grid)
+    else bits.push("Spot")
+    if (priceChart.area || resolvedPriceArea) bits.push(priceChart.area || resolvedPriceArea)
+    return bits.join(" ")
+  }
+  readonly property int priceHour: {
+    // Re-evaluate when `now` ticks so the accent bar moves with the clock.
+    var _ = now
+    return new Date().getHours()
+  }
+  readonly property string priceSummaryLine: Model.priceSummary(priceChart, priceHour)
+  readonly property var selectedPriceBar: {
+    if (selectedPriceHour < 0) return null
+    for (var i = 0; i < priceBars.length; i++)
+      if (priceBars[i].hour === selectedPriceHour) return priceBars[i]
+    return null
+  }
+  readonly property var selectedPriceDetail: selectedPriceBar && selectedPriceBar.detail
+    ? selectedPriceBar.detail : null
+  readonly property var chargeCostLine: {
+    var detail = selectedPriceDetail
+    if (!detail || detail.total === null) return ""
+    var est = Model.chargeEstimate(snapshot, detail.total)
+    return est ? est.label : ""
+  }
+  onPriceAreaChanged: { pricesCheckedAt = 0; Qt.callLater(refreshPrices) }
+  onPriceGridChanged: { pricesCheckedAt = 0; Qt.callLater(refreshPrices) }
+  onPricePartsChanged: { pricesCheckedAt = 0; Qt.callLater(refreshPrices) }
+  onResolvedPriceAreaChanged: { pricesCheckedAt = 0; Qt.callLater(refreshPrices) }
 
   readonly property var car: snapshot ? snapshot.state : null
   readonly property string carName: Model.carName(car, Model.readSetting(settings, "name"))
@@ -122,6 +169,7 @@ Panel {
     now = Date.now() / 1000
     root.controller.show()
     refreshStatus()
+    refreshPrices()
     // Reopening within half a minute shows what is already there.
     if (!snapshot || now - snapshot.fetchedAt > 30) refresh()
   }
@@ -130,8 +178,41 @@ Panel {
     if (!statusProc.running && Date.now() / 1000 - tessieCheckedAt > 120) statusProc.running = true
   }
 
+  // Prices change once a day; refetch at most every 15 minutes, or when a
+  // price setting / zone changes. A failed fetch leaves the last good chart up.
+  function refreshPrices() {
+    if (!pluginDir || pricesProc.running) return
+    if (priceBars.length > 0 && Date.now() / 1000 - pricesCheckedAt < 900) return
+    var day = Model.calendarDay()
+    var plan = Model.priceFetchPlan(resolvedPriceArea, priceGrid, priceParts, day)
+    if (!plan.spot) return
+    pricesProc.environment = Object.assign({}, root.cliEnvironment, {
+      TESSIE_PRICE_PLAN: JSON.stringify(plan)
+    })
+    pricesProc.command = [root.cli, "prices"]
+    pricesProc.running = true
+  }
+
+  function selectPriceHour(hour) {
+    selectedPriceHour = selectedPriceHour === hour ? -1 : hour
+  }
+
+  function takePrices(text) {
+    var chart = Model.consumerPrices(text, {
+      day: Model.calendarDay(),
+      grid: priceGrid,
+      parts: priceParts,
+      now: Date.now()
+    })
+    if (chart.bars.length > 0) {
+      priceChart = chart
+      pricesCheckedAt = Date.now() / 1000
+    }
+  }
+
   function close() {
     armedCommand = ""
+    selectedPriceHour = -1
     root.controller.hide()
   }
 
@@ -240,6 +321,14 @@ Panel {
         root.tessie = Model.tessieStatus(text)
         root.tessieCheckedAt = Date.now() / 1000
       }
+    }
+  }
+
+  Process {
+    id: pricesProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.takePrices(text)
     }
   }
 
@@ -645,6 +734,174 @@ Panel {
                 color: root.fg
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
+              }
+            }
+
+            // ---- Price summary (always, when we have data) + optional chart.
+            Column {
+              visible: root.priceBars.length > 0
+              width: parent.width
+              spacing: Style.space(4)
+
+              Item {
+                width: parent.width
+                height: Math.max(priceCaption.implicitHeight, priceSummaryText.implicitHeight)
+
+                Text {
+                  id: priceCaption
+                  anchors.left: parent.left
+                  anchors.right: priceSummaryText.left
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  elide: Text.ElideRight
+                  textFormat: Text.PlainText
+                  text: root.showPrices ? root.priceTitle : "Prices"
+                  color: root.muted
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Text {
+                  id: priceSummaryText
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  textFormat: Text.PlainText
+                  text: root.priceSummaryLine
+                  color: root.fg
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              Item {
+                id: priceChartBox
+                visible: root.showPrices
+                width: parent.width
+                height: visible ? Style.space(52) : 0
+
+                Row {
+                  anchors.fill: parent
+                  spacing: 1
+
+                  Repeater {
+                    model: root.priceBars
+
+                    Item {
+                      required property var modelData
+                      width: (priceChartBox.width - 23) / 24
+                      height: priceChartBox.height
+
+                      Rectangle {
+                        anchors.bottom: parent.bottom
+                        anchors.horizontalCenter: parent.horizontalCenter
+                        width: Math.max(2, parent.width - 1)
+                        height: Math.max(
+                          modelData.price === null ? 0 : 2,
+                          parent.height * Model.priceBarFraction(
+                            modelData.price, root.priceChart.min, root.priceChart.max))
+                        radius: 1
+                        color: modelData.hour === root.selectedPriceHour ? root.fg
+                          : modelData.hour === root.priceHour ? Color.accent
+                          : modelData.cheapest ? root.okColor
+                          : modelData.inWindow ? Util.alpha(root.okColor, 0.7)
+                          : modelData.dearest ? root.warnColor
+                          : Util.alpha(root.fg, 0.45)
+                      }
+
+                      MouseArea {
+                        anchors.fill: parent
+                        cursorShape: Qt.PointingHandCursor
+                        onClicked: root.selectPriceHour(modelData.hour)
+                      }
+                    }
+                  }
+                }
+              }
+
+              Item {
+                visible: root.showPrices
+                width: parent.width
+                height: visible ? Style.font.caption + Style.space(2) : 0
+
+                Repeater {
+                  model: [
+                    { hour: 0, text: "00" },
+                    { hour: 6, text: "06" },
+                    { hour: 12, text: "12" },
+                    { hour: 18, text: "18" },
+                    { hour: 23, text: "23" }
+                  ]
+
+                  Text {
+                    required property var modelData
+                    x: modelData.hour * (priceChartBox.width - 23) / 24
+                    width: (priceChartBox.width - 23) / 24
+                    horizontalAlignment: modelData.hour === 0 ? Text.AlignLeft
+                      : modelData.hour === 23 ? Text.AlignRight
+                      : Text.AlignHCenter
+                    textFormat: Text.PlainText
+                    text: modelData.text
+                    color: root.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+              }
+
+              // Click a bar to pin its breakdown here (no hover tooltip).
+              Rectangle {
+                visible: root.showPrices && !!root.selectedPriceDetail
+                width: parent.width
+                height: visible ? priceDetailColumn.implicitHeight + Style.space(12) : 0
+                radius: Style.space(6)
+                color: Util.alpha(root.fg, 0.08)
+
+                Column {
+                  id: priceDetailColumn
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.leftMargin: Style.space(10)
+                  anchors.rightMargin: Style.space(10)
+                  spacing: Style.space(3)
+
+                  Text {
+                    width: parent.width
+                    elide: Text.ElideRight
+                    textFormat: Text.PlainText
+                    text: root.selectedPriceDetail ? root.selectedPriceDetail.title : ""
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Text {
+                    width: parent.width
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    text: root.selectedPriceDetail
+                      ? root.selectedPriceDetail.lines.join(" · ") : ""
+                    color: root.muted
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+
+                  Text {
+                    visible: root.chargeCostLine !== ""
+                    width: parent.width
+                    wrapMode: Text.Wrap
+                    textFormat: Text.PlainText
+                    text: root.chargeCostLine
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  onClicked: root.selectedPriceHour = -1
+                }
               }
             }
           }

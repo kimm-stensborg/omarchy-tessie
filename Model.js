@@ -400,6 +400,480 @@ function mapsUrl(lat, lon, template) {
   return t.replace(/\{lat\}/g, String(lat)).replace(/\{lon\}/g, String(lon))
 }
 
+// ---------------------------------------------------------------- spot prices
+//
+// Day-ahead spot from Energi Data Service, optionally topped with Datahub
+// tariffs (netselskab + Energinet + elafgift) and VAT. Spot is DKK/MWh;
+// Datahub tariffs are already DKK/kWh. The chart always plots kr/kWh.
+
+function pad2(n) {
+  return (n < 10 ? "0" : "") + n
+}
+
+// Local calendar day for `now` (ms or Date), as YYYY-MM-DD.
+function calendarDay(now) {
+  var d = now instanceof Date ? now : new Date(now === undefined || now === null ? Date.now() : now)
+  return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate())
+}
+
+function nextCalendarDay(day) {
+  var parts = String(day || "").split("-").map(function(p) { return parseInt(p, 10) })
+  if (parts.length !== 3 || parts.some(function(p) { return !isFinite(p) })) return ""
+  var d = new Date(parts[0], parts[1] - 1, parts[2] + 1)
+  return calendarDay(d)
+}
+
+function formatKrKwh(kr) {
+  var n = number(kr)
+  if (n === null) return "\u2014"
+  var fixed = Math.abs(n).toFixed(2)
+  return (n < 0 ? "-" : "") + fixed + " kr/kWh"
+}
+
+// Spot as kr/kWh. The API reports DKK/MWh; /1000 is the household unit.
+function formatSpotPrice(dkkPerMwh) {
+  var n = number(dkkPerMwh)
+  return n === null ? "\u2014" : formatKrKwh(n / 1000)
+}
+
+function hourRangeLabel(hour) {
+  var h = Math.max(0, Math.min(23, Math.round(number(hour) || 0)))
+  var next = (h + 1) % 24
+  return pad2(h) + ":00\u2013" + pad2(next) + ":00"
+}
+
+// Grid companies (netselskaber). `codes` are ChargeTypeCode values for the
+// household C-tariff in DatahubPricelist. `none` means spot only.
+var ENERGINET_GLN = "5790000432752"
+
+var GRID_COMPANIES = {
+  none: null,
+  trefor: { gln: "5790000392261", codes: ["C"], label: "TREFOR" },
+  "trefor-ost": { gln: "5790000706686", codes: ["46"], label: "TREFOR \u00d8st" },
+  radius: { gln: "5790000705689", codes: ["DT_C_01"], label: "Radius" },
+  cerius: { gln: "5790000705184", codes: ["30TR_C_ET"], label: "Cerius" },
+  n1: { gln: "5790001089030", codes: ["CD"], label: "N1" },
+  konstant: { gln: "5790000704842", codes: ["C_FBTNTR_B"], label: "Konstant" },
+  dinel: { gln: "5790000610099", codes: ["TCL>100_02"], label: "Dinel" },
+  "nord-energi": { gln: "5790000610877", codes: ["TAC"], label: "Nord Energi" },
+  flow: { gln: "5790000392551", codes: ["FE1 NT-01"], label: "FLOW" },
+  "vores-elnet": { gln: "5790000610976", codes: ["TNT1009"], label: "Vores Elnet" },
+  rah: { gln: "5790000681327", codes: ["RAH-C"], label: "RAH" },
+  "elnet-midt": { gln: "5790001100520", codes: ["T3001"], label: "Elnet Midt" },
+  zeanet: { gln: "5790001089375", codes: ["43110"], label: "Zeanet" },
+  "l-net": { gln: "5790001090111", codes: ["3000"], label: "L-Net" }
+}
+
+var GRID_OPTIONS = [
+  { value: "none", label: "Spot only", description: "No net tariff" },
+  { value: "trefor", label: "TREFOR El-net", description: "Triangle area / EWII" },
+  { value: "trefor-ost", label: "TREFOR El-net \u00d8st", description: "East of TREFOR" },
+  { value: "radius", label: "Radius", description: "Copenhagen area" },
+  { value: "cerius", label: "Cerius", description: "Zealand" },
+  { value: "n1", label: "N1", description: "Central Jutland" },
+  { value: "konstant", label: "Konstant", description: "East Jutland" },
+  { value: "dinel", label: "Dinel", description: "South Jutland" },
+  { value: "nord-energi", label: "Nord Energi Net", description: "North Jutland" },
+  { value: "flow", label: "FLOW Elnet", description: "South Funen" },
+  { value: "vores-elnet", label: "Vores Elnet", description: "North Funen" },
+  { value: "rah", label: "RAH Net", description: "Ringk\u00f8bing area" },
+  { value: "elnet-midt", label: "Elnet Midt", description: "Mid Jutland" },
+  { value: "zeanet", label: "Zeanet", description: "Lolland-Falster" },
+  { value: "l-net", label: "L-Net", description: "Lemvig area" }
+]
+
+var PRICE_PART_OPTIONS = [
+  { value: "energinet", label: "Energinet" },
+  { value: "elafgift", label: "Elafgift" },
+  { value: "vat", label: "VAT" }
+]
+
+var PRICE_PART_DEFAULTS = ["energinet", "elafgift", "vat"]
+
+// DK1 is west of the Great Belt (Jutland + Funen), DK2 is east (Zealand+).
+// Returns null when the point is not in Denmark.
+function denmarkPriceArea(lat, lon) {
+  var la = number(lat), lo = number(lon)
+  if (la === null || lo === null) return null
+  if (la < 54.5 || la > 58.0 || lo < 7.5 || lo > 15.6) return null
+  return lo < 11.0 ? "DK1" : "DK2"
+}
+
+// `setting` is auto / DK1 / DK2. Auto follows the car when it is in Denmark.
+function resolvePriceArea(setting, lat, lon) {
+  if (setting === "DK1" || setting === "DK2") return setting
+  return denmarkPriceArea(lat, lon) || "DK2"
+}
+
+function pricesUrl(area, day) {
+  var zone = area === "DK1" ? "DK1" : "DK2"
+  var start = String(day || calendarDay()) + "T00:00"
+  var endDay = nextCalendarDay(String(day || calendarDay()))
+  if (!endDay) return ""
+  var end = endDay + "T00:00"
+  return "https://api.energidataservice.dk/dataset/DayAheadPrices"
+    + "?start=" + encodeURIComponent(start)
+    + "&end=" + encodeURIComponent(end)
+    + "&filter=" + encodeURIComponent(JSON.stringify({ PriceArea: [zone] }))
+    + "&sort=TimeDK&limit=200"
+}
+
+function datahubPricelistUrl(filter) {
+  var columns = ["GLN_Number", "ChargeOwner", "ChargeType", "ChargeTypeCode", "Note",
+    "ValidFrom", "ValidTo"]
+  for (var i = 1; i <= 24; i++) columns.push("Price" + i)
+  return "https://api.energidataservice.dk/dataset/DatahubPricelist"
+    + "?limit=50&sort=" + encodeURIComponent("ValidFrom DESC")
+    + "&columns=" + encodeURIComponent(columns.join(","))
+    + "&filter=" + encodeURIComponent(JSON.stringify(filter))
+}
+
+// What bin/tessie prices should download for the current settings.
+function priceFetchPlan(area, grid, parts, day) {
+  var wanted = String(day || calendarDay())
+  var chosen = choiceList(parts === undefined || parts === null ? PRICE_PART_DEFAULTS : parts)
+  var plan = {
+    day: wanted,
+    spot: pricesUrl(area, wanted),
+    net: null,
+    system: null,
+    transmission: null,
+    elafgift: null
+  }
+  var company = GRID_COMPANIES[grid] || null
+  if (company) {
+    plan.net = datahubPricelistUrl({
+      GLN_Number: [company.gln],
+      ChargeType: ["D03"],
+      ChargeTypeCode: company.codes.slice()
+    })
+  }
+  if (chosen.indexOf("energinet") !== -1) {
+    plan.system = datahubPricelistUrl({
+      GLN_Number: [ENERGINET_GLN], ChargeTypeCode: ["41000"]
+    })
+    plan.transmission = datahubPricelistUrl({
+      GLN_Number: [ENERGINET_GLN], ChargeTypeCode: ["40000"]
+    })
+  }
+  if (chosen.indexOf("elafgift") !== -1) {
+    plan.elafgift = datahubPricelistUrl({
+      GLN_Number: [ENERGINET_GLN], ChargeTypeCode: ["EA-001"]
+    })
+  }
+  return plan
+}
+
+function parsePriceRecords(raw) {
+  if (!raw) return []
+  if (Array.isArray(raw)) return raw
+  var data = raw
+  if (typeof raw === "string") {
+    try { data = JSON.parse(raw) } catch (e) { return [] }
+  }
+  return data && Array.isArray(data.records) ? data.records : []
+}
+
+// The Datahub row valid on `day` (ValidFrom inclusive, ValidTo exclusive).
+function pickTariffRecord(raw, day) {
+  var wanted = String(day || "")
+  var records = parsePriceRecords(raw)
+  var best = null
+  for (var i = 0; i < records.length; i++) {
+    var rec = records[i]
+    var from = String(rec.ValidFrom || "").slice(0, 10)
+    var to = String(rec.ValidTo || "9999-12-31").slice(0, 10)
+    if (!from || (wanted && (from > wanted || wanted >= to))) continue
+    if (!best || from > String(best.ValidFrom || "").slice(0, 10)) best = rec
+  }
+  return best
+}
+
+// Price1–24 in DKK/kWh. A flat tariff only fills Price1.
+function tariffHours(record) {
+  if (!record) return null
+  var flat = number(record.Price1)
+  var hours = []
+  var any = false
+  for (var i = 1; i <= 24; i++) {
+    var p = number(record["Price" + i])
+    if (p === null) p = flat
+    if (p !== null) any = true
+    hours.push(p)
+  }
+  return any ? hours : null
+}
+
+function resolveCurrentHour(options) {
+  options = options || {}
+  var currentHour = number(options.currentHour)
+  if (currentHour === null) {
+    var when = options.now instanceof Date ? options.now
+      : new Date(options.now === undefined || options.now === null ? Date.now() : options.now)
+    currentHour = when.getHours()
+  }
+  return Math.max(0, Math.min(23, Math.round(currentHour)))
+}
+
+// One bar per hour for `day` (YYYY-MM-DD, Danish local TimeDK). `bar.price` is
+// still DKK/MWh here; consumerPrices converts to kr/kWh and adds tariffs.
+function dayPrices(raw, day, options) {
+  var wanted = String(day || "")
+  var currentHour = resolveCurrentHour(options)
+
+  var buckets = []
+  for (var i = 0; i < 24; i++) buckets.push([])
+  var area = ""
+  var records = parsePriceRecords(raw)
+  for (var r = 0; r < records.length; r++) {
+    var rec = records[r]
+    var t = String(rec.TimeDK || "")
+    if (wanted && t.slice(0, 10) !== wanted) continue
+    var hour = parseInt(t.slice(11, 13), 10)
+    if (!isFinite(hour) || hour < 0 || hour > 23) continue
+    var price = number(rec.DayAheadPriceDKK)
+    if (price === null) continue
+    buckets[hour].push(price)
+    if (!area && rec.PriceArea) area = String(rec.PriceArea)
+  }
+
+  var bars = []
+  var seen = []
+  for (var h = 0; h < 24; h++) {
+    var vals = buckets[h]
+    if (vals.length === 0) {
+      bars.push({
+        hour: h, price: null, label: pad2(h), current: h === currentHour,
+        cheapest: false, dearest: false, tip: hourRangeLabel(h) + " \u00b7 \u2014"
+      })
+      continue
+    }
+    var sum = 0
+    for (var j = 0; j < vals.length; j++) sum += vals[j]
+    var avg = sum / vals.length
+    seen.push(avg)
+    bars.push({
+      hour: h, price: avg, label: pad2(h), current: h === currentHour,
+      cheapest: false, dearest: false, tip: ""
+    })
+  }
+
+  if (seen.length === 0) {
+    return { day: wanted, area: area, bars: [], min: null, max: null }
+  }
+
+  var min = Math.min.apply(null, seen)
+  var max = Math.max.apply(null, seen)
+  for (var b = 0; b < bars.length; b++) {
+    var bar = bars[b]
+    if (bar.price === null) continue
+    bar.cheapest = bar.price === min
+    bar.dearest = bar.price === max
+    var tip = hourRangeLabel(bar.hour) + " \u00b7 " + formatSpotPrice(bar.price)
+    if (area) tip += " \u00b7 " + area
+    if (bar.cheapest && min !== max) tip += " \u00b7 cheapest"
+    else if (bar.dearest && min !== max) tip += " \u00b7 dearest"
+    bar.tip = tip
+  }
+
+  return { day: wanted, area: area, bars: bars, min: min, max: max }
+}
+
+// Combine spot + optional tariffs into the chart the panel draws. `bundle` is
+// what `bin/tessie prices` prints; `options.grid` / `parts` mirror the settings.
+function consumerPrices(bundle, options) {
+  options = options || {}
+  var data = bundle
+  if (typeof bundle === "string") {
+    try { data = JSON.parse(bundle) } catch (e) { return { day: "", area: "", grid: "", bars: [], min: null, max: null } }
+  }
+  if (!data || !data.ok) {
+    return { day: "", area: "", grid: "", bars: [], min: null, max: null }
+  }
+
+  var day = String(options.day || data.day || calendarDay())
+  var gridId = String(options.grid || "none")
+  var company = GRID_COMPANIES[gridId] || null
+  var parts = choiceList(options.parts === undefined || options.parts === null
+    ? PRICE_PART_DEFAULTS : options.parts)
+  var withVat = parts.indexOf("vat") !== -1
+  var spotChart = dayPrices(data.spot, day, options)
+  if (spotChart.bars.length === 0) {
+    return { day: day, area: spotChart.area, grid: company ? company.label : "", bars: [], min: null, max: null }
+  }
+
+  var netHours = company ? tariffHours(pickTariffRecord(data.net, day)) : null
+  var systemHours = parts.indexOf("energinet") !== -1
+    ? tariffHours(pickTariffRecord(data.system, day)) : null
+  var transmissionHours = parts.indexOf("energinet") !== -1
+    ? tariffHours(pickTariffRecord(data.transmission, day)) : null
+  var taxHours = parts.indexOf("elafgift") !== -1
+    ? tariffHours(pickTariffRecord(data.elafgift, day)) : null
+
+  var bars = []
+  var seen = []
+  for (var h = 0; h < spotChart.bars.length; h++) {
+    var src = spotChart.bars[h]
+    if (src.price === null) {
+      bars.push({
+        hour: src.hour, price: null, spot: null, net: null, system: null,
+        transmission: null, tax: null, pretax: null, label: src.label,
+        current: src.current, cheapest: false, dearest: false, inWindow: false,
+        tip: hourRangeLabel(src.hour) + " \u00b7 \u2014",
+        detail: { title: hourRangeLabel(src.hour), lines: ["\u2014"], total: null }
+      })
+      continue
+    }
+    var spot = src.price / 1000
+    var net = netHours ? (number(netHours[src.hour]) || 0) : 0
+    var system = systemHours ? (number(systemHours[src.hour]) || 0) : 0
+    var transmission = transmissionHours ? (number(transmissionHours[src.hour]) || 0) : 0
+    var tax = taxHours ? (number(taxHours[src.hour]) || 0) : 0
+    var pretax = spot + net + system + transmission + tax
+    var total = withVat ? pretax * 1.25 : pretax
+    seen.push(total)
+    bars.push({
+      hour: src.hour, price: total, spot: spot, net: net, system: system,
+      transmission: transmission, tax: tax, pretax: pretax, label: src.label,
+      current: src.current, cheapest: false, dearest: false, inWindow: false, tip: "",
+      detail: null
+    })
+  }
+
+  if (seen.length === 0) {
+    return { day: day, area: spotChart.area, grid: company ? company.label : "",
+      bars: [], min: null, max: null, window: null }
+  }
+
+  var min = Math.min.apply(null, seen)
+  var max = Math.max.apply(null, seen)
+  var extras = !!(netHours || systemHours || transmissionHours || taxHours || withVat)
+  var window = cheapestWindow(bars, 0, 3)
+  for (var b = 0; b < bars.length; b++) {
+    var bar = bars[b]
+    if (bar.price === null) continue
+    bar.cheapest = bar.price === min
+    bar.dearest = bar.price === max
+    bar.inWindow = !!(window && bar.hour >= window.start && bar.hour < window.end)
+    bar.detail = priceBarDetail(bar, {
+      area: spotChart.area, grid: company ? company.label : "", extras: extras,
+      net: !!netHours, fees: !!(systemHours || transmissionHours || taxHours), vat: withVat
+    })
+    bar.tip = bar.detail.lines.join(" \u00b7 ")
+  }
+
+  return {
+    day: day,
+    area: spotChart.area,
+    grid: company ? company.label : "",
+    bars: bars,
+    min: min,
+    max: max,
+    window: window
+  }
+}
+
+// Cheapest run of `length` consecutive hours with prices, from `fromHour`.
+function cheapestWindow(bars, fromHour, length) {
+  var len = Math.max(1, Math.round(number(length) || 3))
+  var from = Math.max(0, Math.round(number(fromHour) || 0))
+  var best = null
+  if (!bars || bars.length < len) return null
+  for (var start = from; start <= bars.length - len; start++) {
+    var sum = 0
+    var ok = true
+    for (var i = 0; i < len; i++) {
+      var p = number(bars[start + i] && bars[start + i].price)
+      if (p === null) { ok = false; break }
+      sum += p
+    }
+    if (!ok) continue
+    if (!best || sum < best.sum)
+      best = { start: start, end: start + len, sum: sum, avg: sum / len }
+  }
+  return best
+}
+
+// Structured breakdown for the click panel under the chart.
+function priceBarDetail(bar, opts) {
+  opts = opts || {}
+  if (!bar || bar.price === null)
+    return { title: hourRangeLabel(bar ? bar.hour : 0), lines: ["—"], total: null }
+  var lines = [formatKrKwh(bar.price)]
+  if (opts.extras) {
+    lines.push("spot " + formatKrKwh(bar.spot))
+    if (opts.net) lines.push("net " + formatKrKwh(bar.net))
+    if (opts.fees) {
+      var fees = (bar.system || 0) + (bar.transmission || 0) + (bar.tax || 0)
+      lines.push("fees " + formatKrKwh(fees))
+    }
+    if (opts.vat) lines.push("incl. VAT")
+  } else if (opts.area) {
+    lines.push(opts.area)
+  }
+  if (bar.inWindow) lines.push("cheapest 3 h")
+  else if (bar.cheapest) lines.push("cheapest hour")
+  else if (bar.dearest) lines.push("dearest hour")
+  var title = hourRangeLabel(bar.hour)
+  if (opts.grid) title += " · " + opts.grid
+  else if (opts.area) title += " · " + opts.area
+  return { title: title, lines: lines, total: bar.price }
+}
+
+// kWh and cost to reach the charge limit at `priceKrKwh`. Pack size is
+// inferred from the current range and battery percent (~0.24 kWh/mi).
+function chargeEstimate(snapshot, priceKrKwh) {
+  var ch = snapshot && snapshot.state && snapshot.state.charge_state
+  if (!ch) return null
+  var level = number(ch.battery_level)
+  var limit = number(ch.charge_limit_soc)
+  var range = number(ch.battery_range)
+  if (level === null || limit === null || range === null || level <= 0) return null
+  var pct = Math.max(0, limit - level)
+  if (pct === 0) {
+    return { kwh: 0, cost: 0, pct: 0, label: "Already at the charge limit" }
+  }
+  var fullMiles = range / (level / 100)
+  var kwh = fullMiles * (pct / 100) * 0.24
+  var price = number(priceKrKwh)
+  var cost = price === null ? null : kwh * price
+  var label = formatEnergy(kwh) + " to " + Math.round(limit) + "%"
+  if (cost !== null) label += " · ~" + formatKrKwh(cost).replace(" kr/kWh", " kr")
+  return { kwh: kwh, cost: cost, pct: pct, label: label }
+}
+
+// One-line summary under the battery: now-price and the cheapest 3 h window.
+function priceSummary(chart, currentHour) {
+  if (!chart || !chart.bars || chart.bars.length === 0) return ""
+  var hour = Math.max(0, Math.min(23, Math.round(number(currentHour) || 0)))
+  var cur = null
+  for (var i = 0; i < chart.bars.length; i++) {
+    if (chart.bars[i].hour === hour) { cur = chart.bars[i]; break }
+  }
+  var bits = []
+  if (cur && cur.price !== null) bits.push("now " + formatKrKwh(cur.price))
+  var rest = cheapestWindow(chart.bars, hour, 3) || chart.window
+  if (rest && rest.avg !== null && rest.avg !== undefined) {
+    bits.push("best " + pad2(rest.start) + "\u2013" + pad2(rest.end)
+      + " " + formatKrKwh(rest.avg))
+  }
+  return bits.join(" · ")
+}
+
+// Bar height as a fraction of the chart. Anchored at 0 so negative prices stay
+// readable; a flat day fills half the chart rather than collapsing to a line.
+function priceBarFraction(price, min, max) {
+  var p = number(price)
+  var rawMin = number(min)
+  var rawMax = number(max)
+  if (p === null || rawMin === null || rawMax === null) return 0
+  if (rawMax === rawMin) return 0.5
+  var lo = Math.min(0, rawMin)
+  var hi = Math.max(0, rawMax)
+  if (hi === lo) return 0.5
+  return Math.max(0, Math.min(1, (p - lo) / (hi - lo)))
+}
+
 // ---------------------------------------------------------------- settings
 //
 // Everything the settings page shows, in the order it shows it. One list
@@ -433,44 +907,52 @@ var STAT_OPTIONS = [
   { value: "climate", label: "Climate" }, { value: "software", label: "Software" }
 ]
 
+// Left-menu sections. Long choice lists set `picker: "search"`. Rows with
+// `when` hide until that setting matches (price extras wait for the chart).
 var SETTINGS = [
-  { title: "Car", rows: [
+  { title: "Car", blurb: "Which car to show, and how to read its units.", rows: [
     { key: "name", kind: "text", label: "Name", fallback: "",
-      placeholder: "From the car", hint: "Empty uses the name set in the car, else its model" },
+      placeholder: "From the car" },
     { key: "vin", kind: "text", label: "VIN", fallback: "",
-      placeholder: "First car on the account", hint: "Which car to show" },
+      placeholder: "First car on the account" },
     { key: "units", kind: "choice", label: "Units", fallback: "",
       options: [{ value: "", label: "Follow the car" }, { value: "metric", label: "Metric" },
                 { value: "imperial", label: "Imperial" }] }
   ]},
-  { title: "In the bar", rows: [
+  { title: "Prices", blurb: "Your netselskab — not your elselskab — plus spot area and fees.", rows: [
+    { key: "showPrices", kind: "toggle", label: "Chart under the battery", fallback: true },
+    { key: "priceArea", kind: "choice", label: "Spot area", fallback: "auto",
+      options: [{ value: "auto", label: "Auto" }, { value: "DK1", label: "DK1 west" },
+                { value: "DK2", label: "DK2 east" }] },
+    { key: "priceGrid", kind: "choice", label: "Netselskab", fallback: "none",
+      picker: "search", options: GRID_OPTIONS },
+    { key: "priceParts", kind: "multi", label: "Add on top",
+      when: { key: "showPrices", is: true },
+      fallback: PRICE_PART_DEFAULTS, options: PRICE_PART_OPTIONS }
+  ]},
+  { title: "Panel", blurb: "What the popup shows: map, vitals and control buttons.", rows: [
     { key: "barLabel", kind: "choice", label: "Next to the T", fallback: "none",
       options: [{ value: "none", label: "Nothing" }, { value: "battery", label: "Battery" },
-                { value: "range", label: "Range" }] }
-  ]},
-  { title: "In the panel", rows: [
+                { value: "range", label: "Range" }] },
     { key: "showMap", kind: "toggle", label: "Map", fallback: true },
-    { key: "mapZoom", kind: "number", label: "Map zoom", fallback: 16, min: 3, max: 19,
-      hint: "Past 16 needs a CARTO key" },
+    { key: "mapZoom", kind: "number", label: "Map zoom", fallback: 16, min: 3, max: 19 },
     { key: "stats", kind: "multi", label: "Vitals",
       fallback: STAT_OPTIONS.map(function(o) { return o.value }), options: STAT_OPTIONS },
     { key: "controls", kind: "multi", label: "Controls",
-      hint: "Six fit under the vitals; the rest are there to swap in",
+      hint: "Six fit; the rest are there to swap in",
       fallback: CONTROL_DEFAULTS, options: CONTROL_OPTIONS },
     { key: "confirmUnlock", kind: "toggle", label: "Ask before unlocking", fallback: true },
-    { key: "showFooter", kind: "toggle", label: "Tessie status footer", fallback: true }
+    { key: "showFooter", kind: "toggle", label: "Status footer", fallback: true }
   ]},
-  { title: "Data", rows: [
-    { key: "refreshMinutes", kind: "number", label: "Refresh while closed (minutes)",
-      fallback: 5, min: 1, max: 60 },
+  { title: "Advanced", blurb: "Polling, demo mode, and map links.", rows: [
+    { key: "refreshMinutes", kind: "number", label: "Refresh while closed", fallback: 5,
+      min: 1, max: 60, hint: "Minutes" },
     { key: "demo", kind: "toggle", label: "Demo car", fallback: false,
-      hint: "A made-up car; never calls Tessie" }
-  ]},
-  { title: "Map and links", rows: [
+      hint: "Never calls Tessie" },
     { key: "cartoKey", kind: "text", label: "CARTO key", fallback: "", secret: true,
-      placeholder: "Esri basemap", hint: "Free at carto.com/basemaps/apikey: sharper tiles, zoom to 19" },
+      placeholder: "Optional — sharper map, zoom to 19" },
     { key: "mapsUrl", kind: "text", label: "Maps link", fallback: "",
-      placeholder: "Google Maps", hint: "{lat} and {lon} are filled in" }
+      placeholder: "Google Maps — use {lat} and {lon}" }
   ]}
 ]
 
@@ -480,6 +962,33 @@ function settingRow(key) {
     for (var r = 0; r < rows.length; r++) if (rows[r].key === key) return rows[r]
   }
   return null
+}
+
+// Should this row show for the current settings? Used by the overlay so price
+// details do not sit there while the chart itself is off.
+function settingVisible(row, settings) {
+  if (!row || !row.when) return true
+  return readSetting(settings, row.when.key) === row.when.is
+}
+
+// Long choice lists become a searchable dropdown rather than a chip wall.
+function choiceUsesSearch(row) {
+  return !!(row && row.kind === "choice" && (row.picker === "search"
+    || (row.options && row.options.length > 5)))
+}
+
+// Long multi lists (vitals, controls) become a two-column checklist instead
+// of a wrapping pill soup.
+function multiUsesGrid(row) {
+  return !!(row && row.kind === "multi" && row.options && row.options.length > 6)
+}
+
+// "6 / 12" next to Vitals / Controls so the selection size is visible at a glance.
+function multiSelectionLabel(row, value) {
+  if (!row || row.kind !== "multi" || !row.options) return ""
+  var chosen = coerceSetting(row, value)
+  var n = Array.isArray(chosen) ? chosen.length : 0
+  return n + " / " + row.options.length
 }
 
 // A multi-value setting. Stored as an array, but it may arrive as a string:
@@ -590,18 +1099,38 @@ function toggleChoice(row, value, option) {
 }
 
 // How tall a row renders, near enough to balance columns by. A text field or
-// a wrapping row of chips takes noticeably more than a switch.
+// a wrapping row of chips takes noticeably more than a switch; a searchable
+// choice is one control, not one chip per option.
 var ROW_WEIGHT = { text: 3, multi: 3, choice: 2, number: 2, toggle: 2 }
+
+function rowWeight(row) {
+  if (!row) return 2
+  if (choiceUsesSearch(row)) return 2
+  return ROW_WEIGHT[row.kind] || 2
+}
 
 function sectionWeight(section) {
   return section.rows.reduce(function(sum, row) {
-    return sum + (ROW_WEIGHT[row.kind] || 2)
+    return sum + rowWeight(row)
   }, 1)
 }
 
+// Does any option in this section differ from its default? Drives the dots
+// on the settings left menu.
+function sectionHasCustom(section, settings) {
+  if (!section || !section.rows) return false
+  for (var r = 0; r < section.rows.length; r++) {
+    var row = section.rows[r]
+    var raw = settings ? settings[row.key] : undefined
+    if (raw !== undefined && raw !== null && !isDefaultSetting(row, coerceSetting(row, raw)))
+      return true
+  }
+  return false
+}
+
 // The sections dealt into `count` columns, in order, so that the tallest
-// column comes out as short as it can. The overlay exists to put every option
-// on screen at once, and that only works if the columns are level.
+// column comes out as short as it can. Kept for tests and callers; the
+// settings overlay uses a left menu instead.
 function settingsColumns(count) {
   var wanted = Math.max(1, Math.min(Math.round(count) || 1, SETTINGS.length))
   var weights = SETTINGS.map(sectionWeight)
@@ -683,11 +1212,26 @@ if (typeof module !== "undefined") {
     dataUpdated: dataUpdated, carName: carName, tessieStatus: tessieStatus,
     tileGrid: tileGrid, tileUrl: tileUrl, mapMaxZoom: mapMaxZoom,
     mapAttribution: mapAttribution, mapsUrl: mapsUrl,
+    pad2: pad2, calendarDay: calendarDay, nextCalendarDay: nextCalendarDay,
+    formatKrKwh: formatKrKwh, formatSpotPrice: formatSpotPrice, hourRangeLabel: hourRangeLabel,
+    ENERGINET_GLN: ENERGINET_GLN, GRID_COMPANIES: GRID_COMPANIES, GRID_OPTIONS: GRID_OPTIONS,
+    PRICE_PART_OPTIONS: PRICE_PART_OPTIONS, PRICE_PART_DEFAULTS: PRICE_PART_DEFAULTS,
+    denmarkPriceArea: denmarkPriceArea, resolvePriceArea: resolvePriceArea,
+    pricesUrl: pricesUrl, datahubPricelistUrl: datahubPricelistUrl, priceFetchPlan: priceFetchPlan,
+    parsePriceRecords: parsePriceRecords, pickTariffRecord: pickTariffRecord,
+    tariffHours: tariffHours, dayPrices: dayPrices, consumerPrices: consumerPrices,
+    cheapestWindow: cheapestWindow, priceBarDetail: priceBarDetail,
+    chargeEstimate: chargeEstimate, priceSummary: priceSummary,
+    priceBarFraction: priceBarFraction,
     stats: stats, barLabel: barLabel, SETTINGS: SETTINGS, settingRow: settingRow,
+    settingVisible: settingVisible, choiceUsesSearch: choiceUsesSearch,
+    multiUsesGrid: multiUsesGrid, multiSelectionLabel: multiSelectionLabel,
+    rowWeight: rowWeight,
     choiceList: choiceList, coerceSetting: coerceSetting, readSetting: readSetting,
     isDefaultSetting: isDefaultSetting, nextEntry: nextEntry,
     hasCustomSettings: hasCustomSettings, enabledOnly: enabledOnly,
     toggleChoice: toggleChoice, sectionWeight: sectionWeight,
+    sectionHasCustom: sectionHasCustom,
     CONTROL_DEFAULTS: CONTROL_DEFAULTS,
     settingsColumns: settingsColumns, entryFor: entryFor,
     settingsSummary: settingsSummary

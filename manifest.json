@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.kimm-stensborg.tessie",
   "name": "Tessie",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "author": "Kimm Stensborg",
   "license": "MIT",
   "description": "Locate and control your Tesla from the bar, through Tessie",
@@ -99,6 +99,55 @@
           "off"
         ],
         "defaultValue": "on"
+      },
+      {
+        "key": "showPrices",
+        "type": "enum",
+        "label": "Show the electricity price chart under the battery",
+        "options": [
+          "on",
+          "off"
+        ],
+        "defaultValue": "on"
+      },
+      {
+        "key": "priceArea",
+        "type": "enum",
+        "label": "Price area for the spot chart (auto follows the car in Denmark)",
+        "options": [
+          "auto",
+          "DK1",
+          "DK2"
+        ],
+        "defaultValue": "auto"
+      },
+      {
+        "key": "priceGrid",
+        "type": "enum",
+        "label": "Grid company for the net tariff (none = spot only)",
+        "options": [
+          "none",
+          "trefor",
+          "trefor-ost",
+          "radius",
+          "cerius",
+          "n1",
+          "konstant",
+          "dinel",
+          "nord-energi",
+          "flow",
+          "vores-elnet",
+          "rah",
+          "elnet-midt",
+          "zeanet",
+          "l-net"
+        ],
+        "defaultValue": "none"
+      },
+      {
+        "key": "priceParts",
+        "type": "string",
+        "label": "Extra price parts, space separated: energinet, elafgift, vat (empty shows all three)"
       },
       {
         "key": "refreshMinutes",
